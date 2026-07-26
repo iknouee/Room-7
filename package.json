@@ -1,0 +1,19 @@
+{
+  "name": "room-7-discord-bot",
+  "version": "1.0.0",
+  "description": "Official Room 7 Discord bot with colour and notification role panels.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.19.3",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0"
+  }
+}

@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: room-7-discord-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    autoDeploy: true
