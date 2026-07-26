@@ -46,6 +46,18 @@ const defaultConfig = {
   panel: { channelId: null, messageId: null },
   welcome: { channelId: null },
   qotd: { channelId: null, roleId: null, time: '18:00', lastPostedDate: null },
+  moderation: {
+    enabled: true,
+    logChannelId: null,
+    antispam: { enabled: true, messages: 6, seconds: 8, timeoutMinutes: 10 },
+    links: { enabled: false },
+    invites: { enabled: true },
+    massMentions: { enabled: true, limit: 5, timeoutMinutes: 10 },
+    raid: { enabled: true, joins: 8, seconds: 20, lockdownMinutes: 10, activeUntil: 0 },
+    accountAge: { enabled: true, minimumDays: 3, action: 'alert' },
+    lockedChannels: {},
+  },
+  warnings: {},
 };
 
 const questions = [
@@ -83,8 +95,12 @@ const questions = [
 
 let config = structuredClone(defaultConfig);
 let dataChannel = null;
-let dataMessage = null;
+let dataMessages = [];
 let qotdTimer = null;
+const spamTracker = new Map();
+const recentJoins = [];
+const invitePattern = /(?:https?:\/\/)?(?:www\.)?(?:discord(?:app)?\.com\/invite|discord\.gg)\/[a-z0-9-]+/i;
+const urlPattern = /https?:\/\/[^\s<]+/i;
 
 const commands = [
   new SlashCommandBuilder()
@@ -122,6 +138,46 @@ const commands = [
       .addChannelOption((option) => option.setName('channel').setDescription('The QOTD channel.').addChannelTypes(ChannelType.GuildText).setRequired(true))
       .addRoleOption((option) => option.setName('role').setDescription('The role to ping each day.').setRequired(true))
       .addStringOption((option) => option.setName('time').setDescription('UK time in 24-hour format, e.g. 18:00.').setRequired(false)))
+    .addSubcommand((sub) => sub
+      .setName('moderation')
+      .setDescription('Enable or disable automatic moderation.')
+      .addBooleanOption((option) => option.setName('enabled').setDescription('Whether automatic moderation is enabled.').setRequired(true)))
+    .addSubcommand((sub) => sub
+      .setName('modlogs')
+      .setDescription('Choose the moderation log channel.')
+      .addChannelOption((option) => option.setName('channel').setDescription('Where moderation actions are logged.').addChannelTypes(ChannelType.GuildText).setRequired(true)))
+    .addSubcommand((sub) => sub
+      .setName('antispam')
+      .setDescription('Configure automatic spam protection.')
+      .addBooleanOption((option) => option.setName('enabled').setDescription('Enable spam protection.').setRequired(true))
+      .addIntegerOption((option) => option.setName('messages').setDescription('Messages allowed within the time window.').setMinValue(3).setMaxValue(15))
+      .addIntegerOption((option) => option.setName('seconds').setDescription('Spam time window in seconds.').setMinValue(3).setMaxValue(30))
+      .addIntegerOption((option) => option.setName('timeout').setDescription('Timeout length in minutes.').setMinValue(1).setMaxValue(1440)))
+    .addSubcommand((sub) => sub
+      .setName('links')
+      .setDescription('Configure blocking of regular website links.')
+      .addBooleanOption((option) => option.setName('enabled').setDescription('Block regular website links.').setRequired(true)))
+    .addSubcommand((sub) => sub
+      .setName('invites')
+      .setDescription('Configure blocking of Discord invite links.')
+      .addBooleanOption((option) => option.setName('enabled').setDescription('Block Discord invite links.').setRequired(true)))
+    .addSubcommand((sub) => sub
+      .setName('raid-protection')
+      .setDescription('Configure join-flood raid protection.')
+      .addBooleanOption((option) => option.setName('enabled').setDescription('Enable raid protection.').setRequired(true))
+      .addIntegerOption((option) => option.setName('joins').setDescription('Joins needed to trigger lockdown.').setMinValue(3).setMaxValue(50))
+      .addIntegerOption((option) => option.setName('seconds').setDescription('Join detection window in seconds.').setMinValue(5).setMaxValue(120))
+      .addIntegerOption((option) => option.setName('lockdown').setDescription('Lockdown length in minutes.').setMinValue(1).setMaxValue(120)))
+    .addSubcommand((sub) => sub
+      .setName('account-age')
+      .setDescription('Configure protection for very new Discord accounts.')
+      .addBooleanOption((option) => option.setName('enabled').setDescription('Enable new-account checks.').setRequired(true))
+      .addIntegerOption((option) => option.setName('days').setDescription('Minimum account age in days.').setMinValue(0).setMaxValue(365))
+      .addStringOption((option) => option.setName('action').setDescription('Action taken for new accounts.').addChoices(
+        { name: 'Alert staff only', value: 'alert' },
+        { name: 'Timeout for 24 hours', value: 'timeout' },
+        { name: 'Kick from server', value: 'kick' },
+      )))
     .addSubcommand((sub) => sub.setName('list').setDescription('View the current bot configuration.'))
     .addSubcommand((sub) => sub
       .setName('clear')
@@ -143,12 +199,51 @@ const commands = [
     .setDescription('Question of the Day controls.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand((sub) => sub.setName('post').setDescription('Post a random question now.')),
+  new SlashCommandBuilder().setName('warn').setDescription('Warn a member.').setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((option) => option.setName('member').setDescription('Member to warn.').setRequired(true))
+    .addStringOption((option) => option.setName('reason').setDescription('Reason for the warning.').setRequired(true).setMaxLength(500)),
+  new SlashCommandBuilder().setName('warnings').setDescription('View a member’s warnings.').setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((option) => option.setName('member').setDescription('Member whose warnings to view.').setRequired(true)),
+  new SlashCommandBuilder().setName('clearwarnings').setDescription('Clear a member’s warnings.').setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((option) => option.setName('member').setDescription('Member whose warnings to clear.').setRequired(true)),
+  new SlashCommandBuilder().setName('timeout').setDescription('Temporarily timeout a member.').setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((option) => option.setName('member').setDescription('Member to timeout.').setRequired(true))
+    .addIntegerOption((option) => option.setName('minutes').setDescription('Timeout length in minutes.').setRequired(true).setMinValue(1).setMaxValue(40320))
+    .addStringOption((option) => option.setName('reason').setDescription('Reason for the timeout.').setMaxLength(500)),
+  new SlashCommandBuilder().setName('untimeout').setDescription('Remove a member’s timeout.').setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+    .addUserOption((option) => option.setName('member').setDescription('Member to remove timeout from.').setRequired(true))
+    .addStringOption((option) => option.setName('reason').setDescription('Reason for removing it.').setMaxLength(500)),
+  new SlashCommandBuilder().setName('kick').setDescription('Kick a member.').setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
+    .addUserOption((option) => option.setName('member').setDescription('Member to kick.').setRequired(true))
+    .addStringOption((option) => option.setName('reason').setDescription('Reason for the kick.').setRequired(true).setMaxLength(500)),
+  new SlashCommandBuilder().setName('ban').setDescription('Ban a member.').setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
+    .addUserOption((option) => option.setName('member').setDescription('Member to ban.').setRequired(true))
+    .addStringOption((option) => option.setName('reason').setDescription('Reason for the ban.').setRequired(true).setMaxLength(500))
+    .addIntegerOption((option) => option.setName('delete-days').setDescription('Delete recent messages from this many days.').setMinValue(0).setMaxValue(7)),
+  new SlashCommandBuilder().setName('unban').setDescription('Unban a user by ID.').setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
+    .addStringOption((option) => option.setName('user-id').setDescription('The banned user’s Discord ID.').setRequired(true))
+    .addStringOption((option) => option.setName('reason').setDescription('Reason for the unban.').setMaxLength(500)),
+  new SlashCommandBuilder().setName('purge').setDescription('Delete recent messages.').setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .addIntegerOption((option) => option.setName('amount').setDescription('Number of messages to delete.').setRequired(true).setMinValue(1).setMaxValue(100))
+    .addUserOption((option) => option.setName('member').setDescription('Only delete messages from this member.')),
+  new SlashCommandBuilder().setName('slowmode').setDescription('Set this channel’s slowmode.').setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+    .addIntegerOption((option) => option.setName('seconds').setDescription('Slowmode delay; use 0 to disable.').setRequired(true).setMinValue(0).setMaxValue(21600)),
+  new SlashCommandBuilder().setName('lock').setDescription('Lock the current channel.').setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+    .addStringOption((option) => option.setName('reason').setDescription('Reason for locking the channel.').setMaxLength(500)),
+  new SlashCommandBuilder().setName('unlock').setDescription('Unlock the current channel.').setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+    .addStringOption((option) => option.setName('reason').setDescription('Reason for unlocking the channel.').setMaxLength(500)),
   new SlashCommandBuilder().setName('roles').setDescription('Open your private Room 7 role selector.'),
   new SlashCommandBuilder().setName('help').setDescription('View the Room 7 bot command guide.'),
   new SlashCommandBuilder().setName('ping').setDescription('Check the bot status and response time.'),
 ].map((command) => command.toJSON());
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+const client = new Client({ intents: [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMembers,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.MessageContent,
+  GatewayIntentBits.GuildModeration,
+] });
 
 function makeBanner() {
   return new AttachmentBuilder(BANNER_PATH, { name: BANNER_NAME });
@@ -260,33 +355,72 @@ async function ensureDataStore(guild) {
       reason: 'Persistent Room 7 bot configuration storage',
       permissionOverwrites: [
         { id: guild.roles.everyone.id, type: OverwriteType.Role, deny: [PermissionFlagsBits.ViewChannel] },
-        { id: client.user.id, type: OverwriteType.Member, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+        { id: client.user.id, type: OverwriteType.Member, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] },
       ],
     });
   }
-  const messages = await dataChannel.messages.fetch({ limit: 50 });
-  dataMessage = messages.find((message) => message.author.id === client.user.id && message.content.startsWith(DATA_PREFIX));
-  if (dataMessage) {
+
+  const messages = await dataChannel.messages.fetch({ limit: 100 });
+  dataMessages = [...messages.values()].filter((message) => message.author.id === client.user.id && message.content.startsWith(DATA_PREFIX));
+  let raw = '';
+  const chunked = dataMessages.filter((message) => /^ROOM7_CONFIG:\d+:\d+:/.test(message.content));
+  if (chunked.length) {
+    raw = chunked
+      .map((message) => {
+        const match = message.content.match(/^ROOM7_CONFIG:(\d+):(\d+):([\s\S]*)$/);
+        return match ? { index: Number(match[1]), content: match[3] } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.index - b.index)
+      .map((item) => item.content)
+      .join('');
+  } else {
+    const legacy = dataMessages.find((message) => message.content.startsWith(DATA_PREFIX));
+    if (legacy) raw = legacy.content.slice(DATA_PREFIX.length);
+  }
+
+  if (raw) {
     try {
-      const stored = JSON.parse(dataMessage.content.slice(DATA_PREFIX.length));
+      const stored = JSON.parse(raw);
       config = { ...structuredClone(defaultConfig), ...stored };
       config.colours = Array.isArray(config.colours) ? config.colours : [];
       config.pings = Array.isArray(config.pings) ? config.pings : [];
       config.panel = { ...defaultConfig.panel, ...(stored.panel || {}) };
       config.welcome = { ...defaultConfig.welcome, ...(stored.welcome || {}) };
       config.qotd = { ...defaultConfig.qotd, ...(stored.qotd || {}) };
+      config.moderation = { ...structuredClone(defaultConfig.moderation), ...(stored.moderation || {}) };
+      config.moderation.antispam = { ...defaultConfig.moderation.antispam, ...(stored.moderation?.antispam || {}) };
+      config.moderation.links = { ...defaultConfig.moderation.links, ...(stored.moderation?.links || {}) };
+      config.moderation.invites = { ...defaultConfig.moderation.invites, ...(stored.moderation?.invites || {}) };
+      config.moderation.massMentions = { ...defaultConfig.moderation.massMentions, ...(stored.moderation?.massMentions || {}) };
+      config.moderation.raid = { ...defaultConfig.moderation.raid, ...(stored.moderation?.raid || {}) };
+      config.moderation.accountAge = { ...defaultConfig.moderation.accountAge, ...(stored.moderation?.accountAge || {}) };
+      config.moderation.lockedChannels = stored.moderation?.lockedChannels || {};
+      config.warnings = stored.warnings && typeof stored.warnings === 'object' ? stored.warnings : {};
     } catch (error) {
       console.error('Stored configuration was invalid; using defaults.', error);
       config = structuredClone(defaultConfig);
     }
   } else {
-    dataMessage = await dataChannel.send(`${DATA_PREFIX}${JSON.stringify(config)}`);
+    config = structuredClone(defaultConfig);
+    await saveConfig();
   }
 }
 
 async function saveConfig() {
-  if (!dataMessage) throw new Error('The configuration store is unavailable.');
-  await dataMessage.edit(`${DATA_PREFIX}${JSON.stringify(config)}`);
+  if (!dataChannel) throw new Error('The configuration store is unavailable.');
+  const json = JSON.stringify(config);
+  const chunkSize = 1750;
+  const chunks = [];
+  for (let index = 0; index < json.length; index += chunkSize) chunks.push(json.slice(index, index + chunkSize));
+
+  const oldMessages = [...dataMessages];
+  dataMessages = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    const message = await dataChannel.send(`${DATA_PREFIX}${index + 1}:${chunks.length}:${chunks[index]}`);
+    dataMessages.push(message);
+  }
+  await Promise.all(oldMessages.map((message) => message.delete().catch(() => null)));
 }
 
 function validateTime(value) {
@@ -358,6 +492,257 @@ async function checkQotdSchedule() {
   }
 }
 
+
+function truncate(value, length = 1000) {
+  const text = String(value || 'Not provided');
+  return text.length > length ? `${text.slice(0, length - 3)}...` : text;
+}
+
+function isStaff(member) {
+  return member.permissions.has(PermissionFlagsBits.ManageMessages)
+    || member.permissions.has(PermissionFlagsBits.ModerateMembers)
+    || member.permissions.has(PermissionFlagsBits.ManageGuild);
+}
+
+function canActOn(actor, target) {
+  if (!target) throw new Error('That member could not be found.');
+  if (target.id === actor.id) throw new Error('You cannot use this command on yourself.');
+  if (target.id === target.guild.ownerId) throw new Error('The server owner cannot be moderated.');
+  if (actor.id !== target.guild.ownerId && target.roles.highest.position >= actor.roles.highest.position) {
+    throw new Error('That member has an equal or higher role than you.');
+  }
+  const botMember = target.guild.members.me;
+  if (target.roles.highest.position >= botMember.roles.highest.position) {
+    throw new Error('Move the Room 7 bot role above that member’s highest role first.');
+  }
+}
+
+async function sendModLog(guild, title, fields = [], color = EMBED_COLOR) {
+  if (!config.moderation.logChannelId) return;
+  const channel = await guild.channels.fetch(config.moderation.logChannelId).catch(() => null);
+  if (!channel?.isTextBased()) return;
+  const embed = new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .addFields(fields.map((field) => ({ ...field, value: truncate(field.value) })))
+    .setTimestamp()
+    .setFooter({ text: 'Room 7 Moderation' });
+  await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => null);
+}
+
+async function notifyUser(user, title, description) {
+  await user.send({ embeds: [new EmbedBuilder().setColor(EMBED_COLOR).setTitle(title).setDescription(description).setFooter({ text: 'Room 7 Moderation' })] }).catch(() => null);
+}
+
+function warningList(userId) {
+  return Array.isArray(config.warnings[userId]) ? config.warnings[userId] : [];
+}
+
+async function addWarning(guild, user, moderator, reason, source = 'Manual warning') {
+  const warnings = warningList(user.id);
+  warnings.push({ reason, moderatorId: moderator?.id || client.user.id, source, timestamp: Date.now() });
+  config.warnings[user.id] = warnings.slice(-25);
+  await saveConfig();
+  await notifyUser(user, 'You received a warning in Room 7', `**Reason:** ${reason}\n\nPlease review the server rules. You now have **${config.warnings[user.id].length} warning(s)**.`);
+  await sendModLog(guild, 'Member Warned', [
+    { name: 'Member', value: `${user.tag} (${user.id})`, inline: true },
+    { name: 'Moderator', value: moderator ? `${moderator.tag} (${moderator.id})` : 'Room 7 AutoMod', inline: true },
+    { name: 'Total Warnings', value: String(config.warnings[user.id].length), inline: true },
+    { name: 'Reason', value: reason },
+    { name: 'Source', value: source },
+  ], 0xF0B35A);
+  return config.warnings[user.id].length;
+}
+
+async function deleteAndExplain(message, reason) {
+  await message.delete().catch(() => null);
+  const notice = await message.channel.send({ content: `${message.author}, ${reason}`, allowedMentions: { users: [message.author.id] } }).catch(() => null);
+  if (notice) setTimeout(() => notice.delete().catch(() => null), 6000);
+}
+
+async function triggerRaidLockdown(guild) {
+  const settings = config.moderation.raid;
+  if (settings.activeUntil > Date.now()) return;
+  settings.activeUntil = Date.now() + settings.lockdownMinutes * 60_000;
+  const changed = [];
+  for (const channel of guild.channels.cache.values()) {
+    if (channel.type !== ChannelType.GuildText) continue;
+    try {
+      const current = channel.permissionOverwrites.cache.get(guild.roles.everyone.id);
+      const previous = current?.allow.has(PermissionFlagsBits.SendMessages) ? 'raid-allowed' : current?.deny.has(PermissionFlagsBits.SendMessages) ? 'raid-denied' : 'raid-neutral';
+      config.moderation.lockedChannels[channel.id] = previous;
+      await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false }, { reason: 'Room 7 automatic raid lockdown' });
+      changed.push(channel.id);
+    } catch (_) {}
+  }
+  await saveConfig();
+  await sendModLog(guild, '🚨 Automatic Raid Lockdown', [
+    { name: 'Reason', value: `${settings.joins} or more joins were detected within ${settings.seconds} seconds.` },
+    { name: 'Channels Locked', value: String(changed.length), inline: true },
+    { name: 'Duration', value: `${settings.lockdownMinutes} minutes`, inline: true },
+  ], 0xE74C3C);
+  setTimeout(async () => {
+    for (const channelId of changed) {
+      const channel = await guild.channels.fetch(channelId).catch(() => null);
+      if (!channel) continue;
+      const previous = config.moderation.lockedChannels[channelId];
+      if (typeof previous === 'string' && previous.startsWith('raid-')) {
+        const restore = previous === 'raid-allowed' ? true : previous === 'raid-denied' ? false : null;
+        await channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: restore }, { reason: 'Room 7 raid lockdown ended' }).catch(() => null);
+        delete config.moderation.lockedChannels[channelId];
+      }
+    }
+    settings.activeUntil = 0;
+    await saveConfig().catch(() => null);
+    await sendModLog(guild, 'Raid Lockdown Ended', [{ name: 'Status', value: 'Automatically restored affected channels.' }], 0x57C785);
+  }, settings.lockdownMinutes * 60_000);
+}
+
+async function handleModerationCommand(interaction) {
+  const command = interaction.commandName;
+  const actor = interaction.member;
+
+  if (command === 'warn' || command === 'warnings' || command === 'clearwarnings' || command === 'timeout' || command === 'untimeout' || command === 'kick' || command === 'ban') {
+    const user = interaction.options.getUser('member', true);
+    const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+    if (command !== 'warnings' && command !== 'clearwarnings') canActOn(actor, member);
+
+    if (command === 'warn') {
+      const reason = interaction.options.getString('reason', true);
+      const count = await addWarning(interaction.guild, user, interaction.user, reason);
+      return interaction.reply({ content: `✅ Warned **${user.tag}**. They now have **${count} warning(s)**.`, flags: MessageFlags.Ephemeral });
+    }
+    if (command === 'warnings') {
+      const warnings = warningList(user.id);
+      const description = warnings.length
+        ? warnings.slice(-10).map((entry, index) => `**${index + 1}.** ${truncate(entry.reason, 180)}\n<t:${Math.floor(entry.timestamp / 1000)}:R> • <@${entry.moderatorId}>`).join('\n\n')
+        : 'This member has no warnings.';
+      return interaction.reply({ embeds: [baseEmbed().setTitle(`Warnings • ${user.tag}`).setDescription(description)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
+    }
+    if (command === 'clearwarnings') {
+      const removed = warningList(user.id).length;
+      delete config.warnings[user.id];
+      await saveConfig();
+      await sendModLog(interaction.guild, 'Warnings Cleared', [
+        { name: 'Member', value: `${user.tag} (${user.id})`, inline: true },
+        { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+        { name: 'Warnings Removed', value: String(removed), inline: true },
+      ], 0x57C785);
+      return interaction.reply({ content: `✅ Cleared **${removed} warning(s)** from **${user.tag}**.`, flags: MessageFlags.Ephemeral });
+    }
+    if (command === 'timeout') {
+      const minutes = interaction.options.getInteger('minutes', true);
+      const reason = interaction.options.getString('reason') || 'No reason provided.';
+      if (!member.moderatable) throw new Error('I cannot timeout that member. Check my role position and permissions.');
+      await member.timeout(minutes * 60_000, reason);
+      await notifyUser(user, 'You were timed out in Room 7', `**Length:** ${minutes} minute(s)\n**Reason:** ${reason}`);
+      await sendModLog(interaction.guild, 'Member Timed Out', [
+        { name: 'Member', value: `${user.tag} (${user.id})`, inline: true },
+        { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+        { name: 'Length', value: `${minutes} minute(s)`, inline: true },
+        { name: 'Reason', value: reason },
+      ], 0xE67E22);
+      return interaction.reply({ content: `✅ Timed out **${user.tag}** for **${minutes} minute(s)**.`, flags: MessageFlags.Ephemeral });
+    }
+    if (command === 'untimeout') {
+      const reason = interaction.options.getString('reason') || 'Timeout removed by staff.';
+      if (!member.moderatable) throw new Error('I cannot update that member. Check my role position and permissions.');
+      await member.timeout(null, reason);
+      await sendModLog(interaction.guild, 'Timeout Removed', [
+        { name: 'Member', value: `${user.tag} (${user.id})`, inline: true },
+        { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+        { name: 'Reason', value: reason },
+      ], 0x57C785);
+      return interaction.reply({ content: `✅ Removed **${user.tag}**’s timeout.`, flags: MessageFlags.Ephemeral });
+    }
+    if (command === 'kick') {
+      const reason = interaction.options.getString('reason', true);
+      if (!member.kickable) throw new Error('I cannot kick that member. Check my role position and permissions.');
+      await notifyUser(user, 'You were removed from Room 7', `**Reason:** ${reason}`);
+      await member.kick(reason);
+      await sendModLog(interaction.guild, 'Member Kicked', [
+        { name: 'Member', value: `${user.tag} (${user.id})`, inline: true },
+        { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+        { name: 'Reason', value: reason },
+      ], 0xE67E22);
+      return interaction.reply({ content: `✅ Kicked **${user.tag}**.`, flags: MessageFlags.Ephemeral });
+    }
+    if (command === 'ban') {
+      const reason = interaction.options.getString('reason', true);
+      const deleteDays = interaction.options.getInteger('delete-days') || 0;
+      if (!member.bannable) throw new Error('I cannot ban that member. Check my role position and permissions.');
+      await notifyUser(user, 'You were banned from Room 7', `**Reason:** ${reason}`);
+      await member.ban({ deleteMessageSeconds: deleteDays * 86_400, reason });
+      await sendModLog(interaction.guild, 'Member Banned', [
+        { name: 'Member', value: `${user.tag} (${user.id})`, inline: true },
+        { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+        { name: 'Messages Deleted', value: `${deleteDays} day(s)`, inline: true },
+        { name: 'Reason', value: reason },
+      ], 0xD64541);
+      return interaction.reply({ content: `✅ Banned **${user.tag}**.`, flags: MessageFlags.Ephemeral });
+    }
+  }
+
+  if (command === 'unban') {
+    const userId = interaction.options.getString('user-id', true).trim();
+    if (!/^\d{17,20}$/.test(userId)) throw new Error('Enter a valid Discord user ID.');
+    const reason = interaction.options.getString('reason') || 'Unbanned by staff.';
+    const ban = await interaction.guild.bans.fetch(userId).catch(() => null);
+    if (!ban) throw new Error('That user is not currently banned.');
+    await interaction.guild.members.unban(userId, reason);
+    await sendModLog(interaction.guild, 'User Unbanned', [
+      { name: 'User', value: `${ban.user.tag} (${userId})`, inline: true },
+      { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+      { name: 'Reason', value: reason },
+    ], 0x57C785);
+    return interaction.reply({ content: `✅ Unbanned **${ban.user.tag}**.`, flags: MessageFlags.Ephemeral });
+  }
+
+  if (command === 'purge') {
+    const amount = interaction.options.getInteger('amount', true);
+    const user = interaction.options.getUser('member');
+    const fetched = await interaction.channel.messages.fetch({ limit: 100 });
+    const selected = fetched.filter((message) => !user || message.author.id === user.id).first(amount);
+    if (!selected.length) throw new Error('No matching recent messages were found.');
+    const deleted = await interaction.channel.bulkDelete(selected, true);
+    await sendModLog(interaction.guild, 'Messages Purged', [
+      { name: 'Moderator', value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
+      { name: 'Channel', value: `${interaction.channel}`, inline: true },
+      { name: 'Deleted', value: String(deleted.size), inline: true },
+      { name: 'Filter', value: user ? `${user.tag} (${user.id})` : 'All members' },
+    ]);
+    return interaction.reply({ content: `✅ Deleted **${deleted.size}** message(s).`, flags: MessageFlags.Ephemeral });
+  }
+
+  if (command === 'slowmode') {
+    const seconds = interaction.options.getInteger('seconds', true);
+    if (!interaction.channel.setRateLimitPerUser) throw new Error('Slowmode cannot be changed in this channel.');
+    await interaction.channel.setRateLimitPerUser(seconds, `Changed by ${interaction.user.tag}`);
+    await sendModLog(interaction.guild, 'Slowmode Updated', [
+      { name: 'Channel', value: `${interaction.channel}`, inline: true },
+      { name: 'Delay', value: seconds ? `${seconds} second(s)` : 'Disabled', inline: true },
+      { name: 'Moderator', value: `${interaction.user.tag}`, inline: true },
+    ]);
+    return interaction.reply({ content: seconds ? `✅ Slowmode set to **${seconds} seconds**.` : '✅ Slowmode disabled.', flags: MessageFlags.Ephemeral });
+  }
+
+  if (command === 'lock' || command === 'unlock') {
+    if (!interaction.channel.permissionOverwrites) throw new Error('This channel cannot be locked.');
+    const reason = interaction.options.getString('reason') || `${command === 'lock' ? 'Locked' : 'Unlocked'} by staff.`;
+    const locked = command === 'lock';
+    await interaction.channel.permissionOverwrites.edit(interaction.guild.roles.everyone, { SendMessages: locked ? false : null }, { reason });
+    if (locked) config.moderation.lockedChannels[interaction.channelId] = 'manual';
+    else delete config.moderation.lockedChannels[interaction.channelId];
+    await saveConfig();
+    await sendModLog(interaction.guild, locked ? 'Channel Locked' : 'Channel Unlocked', [
+      { name: 'Channel', value: `${interaction.channel}`, inline: true },
+      { name: 'Moderator', value: `${interaction.user.tag}`, inline: true },
+      { name: 'Reason', value: reason },
+    ], locked ? 0xE67E22 : 0x57C785);
+    return interaction.reply({ content: locked ? '🔒 This channel has been locked.' : '🔓 This channel has been unlocked.' });
+  }
+}
+
 async function handleConfig(interaction) {
   const subcommand = interaction.options.getSubcommand();
   if (subcommand === 'welcome') {
@@ -374,6 +759,49 @@ async function handleConfig(interaction) {
     config.qotd = { ...config.qotd, channelId: channel.id, roleId: role.id, time };
     await saveConfig();
     return interaction.reply({ embeds: [baseEmbed().setTitle('Question of the Day Configured').setDescription(`A random question will post in ${channel} every day at **${time} UK time**, pinging ${role}.`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
+  }
+  if (subcommand === 'moderation') {
+    config.moderation.enabled = interaction.options.getBoolean('enabled', true);
+    await saveConfig();
+    return interaction.reply({ content: `✅ Automatic moderation is now **${config.moderation.enabled ? 'enabled' : 'disabled'}**.`, flags: MessageFlags.Ephemeral });
+  }
+  if (subcommand === 'modlogs') {
+    const channel = interaction.options.getChannel('channel', true);
+    config.moderation.logChannelId = channel.id;
+    await saveConfig();
+    return interaction.reply({ content: `✅ Moderation actions will be logged in ${channel}.`, flags: MessageFlags.Ephemeral });
+  }
+  if (subcommand === 'antispam') {
+    const settings = config.moderation.antispam;
+    settings.enabled = interaction.options.getBoolean('enabled', true);
+    settings.messages = interaction.options.getInteger('messages') || settings.messages;
+    settings.seconds = interaction.options.getInteger('seconds') || settings.seconds;
+    settings.timeoutMinutes = interaction.options.getInteger('timeout') || settings.timeoutMinutes;
+    await saveConfig();
+    return interaction.reply({ content: `✅ Anti-spam is **${settings.enabled ? 'enabled' : 'disabled'}** — ${settings.messages} messages in ${settings.seconds}s triggers a ${settings.timeoutMinutes}-minute timeout.`, flags: MessageFlags.Ephemeral });
+  }
+  if (subcommand === 'links' || subcommand === 'invites') {
+    const enabled = interaction.options.getBoolean('enabled', true);
+    config.moderation[subcommand].enabled = enabled;
+    await saveConfig();
+    return interaction.reply({ content: `✅ ${subcommand === 'links' ? 'Regular link' : 'Discord invite'} blocking is now **${enabled ? 'enabled' : 'disabled'}**.`, flags: MessageFlags.Ephemeral });
+  }
+  if (subcommand === 'raid-protection') {
+    const settings = config.moderation.raid;
+    settings.enabled = interaction.options.getBoolean('enabled', true);
+    settings.joins = interaction.options.getInteger('joins') || settings.joins;
+    settings.seconds = interaction.options.getInteger('seconds') || settings.seconds;
+    settings.lockdownMinutes = interaction.options.getInteger('lockdown') || settings.lockdownMinutes;
+    await saveConfig();
+    return interaction.reply({ content: `✅ Raid protection is **${settings.enabled ? 'enabled' : 'disabled'}** — ${settings.joins} joins in ${settings.seconds}s triggers a ${settings.lockdownMinutes}-minute lockdown.`, flags: MessageFlags.Ephemeral });
+  }
+  if (subcommand === 'account-age') {
+    const settings = config.moderation.accountAge;
+    settings.enabled = interaction.options.getBoolean('enabled', true);
+    settings.minimumDays = interaction.options.getInteger('days') ?? settings.minimumDays;
+    settings.action = interaction.options.getString('action') || settings.action;
+    await saveConfig();
+    return interaction.reply({ content: `✅ New-account protection is **${settings.enabled ? 'enabled' : 'disabled'}** — accounts under ${settings.minimumDays} day(s) will receive action: **${settings.action}**.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'add-color' || subcommand === 'add-ping') {
     const role = interaction.options.getRole('role', true);
@@ -421,6 +849,8 @@ async function handleConfig(interaction) {
       { name: `🔔 Ping Roles (${config.pings.length})`, value: pingList, inline: true },
       { name: '👋 Welcome Channel', value: config.welcome.channelId ? `<#${config.welcome.channelId}>` : '*Not configured.*' },
       { name: '❓ Question of the Day', value: config.qotd.channelId ? `<#${config.qotd.channelId}> • <@&${config.qotd.roleId}> • **${config.qotd.time} UK**` : '*Not configured.*' },
+      { name: '🛡️ Moderation', value: `AutoMod: **${config.moderation.enabled ? 'On' : 'Off'}**\nLogs: ${config.moderation.logChannelId ? `<#${config.moderation.logChannelId}>` : '*Not configured*'}\nAnti-spam: **${config.moderation.antispam.enabled ? 'On' : 'Off'}**\nLinks: **${config.moderation.links.enabled ? 'Blocked' : 'Allowed'}** • Invites: **${config.moderation.invites.enabled ? 'Blocked' : 'Allowed'}**` },
+      { name: '🚨 Security', value: `Raid protection: **${config.moderation.raid.enabled ? 'On' : 'Off'}**\nNew-account check: **${config.moderation.accountAge.enabled ? `${config.moderation.accountAge.minimumDays}+ days (${config.moderation.accountAge.action})` : 'Off'}**` },
     )],
     files: [makeBanner()],
     flags: MessageFlags.Ephemeral,
@@ -460,12 +890,104 @@ client.once('ready', async () => {
 
 client.on('guildMemberAdd', async (member) => {
   try {
-    if (member.guild.id !== GUILD_ID || !config.welcome.channelId) return;
-    const channel = await member.guild.channels.fetch(config.welcome.channelId).catch(() => null);
-    if (!channel?.isTextBased()) return;
-    await channel.send({ content: `${member}`, embeds: [welcomeEmbed(member)], files: [makeBanner()], allowedMentions: { users: [member.id] } });
+    if (member.guild.id !== GUILD_ID) return;
+
+    if (config.moderation.enabled) {
+      const now = Date.now();
+      const ageDays = Math.floor((now - member.user.createdTimestamp) / 86_400_000);
+      const accountSettings = config.moderation.accountAge;
+      if (accountSettings.enabled && ageDays < accountSettings.minimumDays) {
+        await sendModLog(member.guild, '⚠️ New Account Joined', [
+          { name: 'Member', value: `${member.user.tag} (${member.id})`, inline: true },
+          { name: 'Account Age', value: `${ageDays} day(s)`, inline: true },
+          { name: 'Configured Action', value: accountSettings.action, inline: true },
+          { name: 'Created', value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:F>` },
+        ], 0xF0B35A);
+        if (accountSettings.action === 'timeout' && member.moderatable) {
+          await member.timeout(86_400_000, `Account younger than ${accountSettings.minimumDays} day(s)`).catch(() => null);
+        } else if (accountSettings.action === 'kick' && member.kickable) {
+          await notifyUser(member.user, 'Room 7 account-age protection', `Your Discord account is under **${accountSettings.minimumDays} day(s)** old. Please try joining again when your account is older.`);
+          await member.kick(`Account younger than ${accountSettings.minimumDays} day(s)`).catch(() => null);
+          return;
+        }
+      }
+
+      const raid = config.moderation.raid;
+      if (raid.enabled) {
+        recentJoins.push(now);
+        while (recentJoins.length && recentJoins[0] < now - raid.seconds * 1000) recentJoins.shift();
+        if (recentJoins.length >= raid.joins) await triggerRaidLockdown(member.guild);
+      }
+    }
+
+    if (config.welcome.channelId) {
+      const channel = await member.guild.channels.fetch(config.welcome.channelId).catch(() => null);
+      if (channel?.isTextBased()) {
+        await channel.send({ content: `${member}`, embeds: [welcomeEmbed(member)], files: [makeBanner()], allowedMentions: { users: [member.id] } });
+      }
+    }
   } catch (error) {
-    console.error('Welcome message error:', error);
+    console.error('Member join handling error:', error);
+  }
+});
+
+client.on('messageCreate', async (message) => {
+  try {
+    if (!message.guild || message.guild.id !== GUILD_ID || message.author.bot || !config.moderation.enabled) return;
+    if (!message.member || isStaff(message.member)) return;
+
+    const content = message.content || '';
+    const mentionCount = message.mentions.users.size + message.mentions.roles.size;
+    const mass = config.moderation.massMentions;
+    if (mass.enabled && mentionCount >= mass.limit) {
+      await deleteAndExplain(message, `mass mentions are not allowed. You have been timed out for ${mass.timeoutMinutes} minutes.`);
+      if (message.member.moderatable) await message.member.timeout(mass.timeoutMinutes * 60_000, 'Room 7 AutoMod: mass mentions').catch(() => null);
+      await addWarning(message.guild, message.author, null, `Mass mentioning ${mentionCount} users/roles`, 'AutoMod: mass mentions');
+      return;
+    }
+
+    if (config.moderation.invites.enabled && invitePattern.test(content)) {
+      await deleteAndExplain(message, 'Discord invite links are not allowed here.');
+      await addWarning(message.guild, message.author, null, 'Posted a Discord invite link', 'AutoMod: invite filter');
+      return;
+    }
+
+    if (config.moderation.links.enabled && urlPattern.test(content)) {
+      await deleteAndExplain(message, 'links are currently blocked in this server.');
+      await sendModLog(message.guild, 'Link Blocked', [
+        { name: 'Member', value: `${message.author.tag} (${message.author.id})`, inline: true },
+        { name: 'Channel', value: `${message.channel}`, inline: true },
+        { name: 'Content', value: content },
+      ], 0xF0B35A);
+      return;
+    }
+
+    const spam = config.moderation.antispam;
+    if (spam.enabled) {
+      const key = `${message.guild.id}:${message.author.id}`;
+      const now = Date.now();
+      const entry = spamTracker.get(key) || [];
+      entry.push({ time: now, content: content.trim().toLowerCase() });
+      const recent = entry.filter((item) => item.time >= now - spam.seconds * 1000);
+      spamTracker.set(key, recent);
+      const repeated = recent.length >= 4 && recent.slice(-4).every((item) => item.content && item.content === recent[recent.length - 1].content);
+      if (recent.length >= spam.messages || repeated) {
+        spamTracker.delete(key);
+        const fetched = await message.channel.messages.fetch({ limit: 25 }).catch(() => null);
+        if (fetched) {
+          const matching = fetched.filter((item) => item.author.id === message.author.id && item.createdTimestamp >= now - spam.seconds * 1000);
+          await message.channel.bulkDelete(matching, true).catch(() => null);
+        } else {
+          await message.delete().catch(() => null);
+        }
+        if (message.member.moderatable) await message.member.timeout(spam.timeoutMinutes * 60_000, 'Room 7 AutoMod: spam').catch(() => null);
+        await addWarning(message.guild, message.author, null, 'Spam or repeated-message flooding', 'AutoMod: anti-spam');
+        const notice = await message.channel.send({ content: `${message.author}, spam is not allowed. You have been timed out for ${spam.timeoutMinutes} minutes.`, allowedMentions: { users: [message.author.id] } }).catch(() => null);
+        if (notice) setTimeout(() => notice.delete().catch(() => null), 7000);
+      }
+    }
+  } catch (error) {
+    console.error('AutoMod message error:', error);
   }
 });
 
@@ -497,10 +1019,15 @@ client.on('interactionCreate', async (interaction) => {
         await postQotd(interaction.guild, interaction.channelId);
         return interaction.editReply('✅ A Question of the Day has been posted here.');
       }
+      if (['warn', 'warnings', 'clearwarnings', 'timeout', 'untimeout', 'kick', 'ban', 'unban', 'purge', 'slowmode', 'lock', 'unlock'].includes(interaction.commandName)) {
+        return handleModerationCommand(interaction);
+      }
       if (interaction.commandName === 'roles') return interaction.reply({ embeds: [rolePanelEmbed()], components: [panelButtons()], files: [makeBanner()], flags: MessageFlags.Ephemeral });
       if (interaction.commandName === 'help') return interaction.reply({ embeds: [baseEmbed().setTitle('Room 7 Bot Commands').addFields(
         { name: 'Member Commands', value: '`/roles` — Open your role selector\n`/ping` — Check the bot status' },
         { name: 'Staff Setup', value: '`/config add-color` • `/config add-ping`\n`/config welcome` • `/config qotd`\n`/config list` • `/setup roles`\n`/setup rules` • `/setup about`\n`/qotd post` — Post a question now' },
+        { name: 'Moderation', value: '`/warn` • `/warnings` • `/clearwarnings`\n`/timeout` • `/untimeout` • `/kick` • `/ban` • `/unban`\n`/purge` • `/slowmode` • `/lock` • `/unlock`' },
+        { name: 'Security Setup', value: '`/config modlogs` • `/config moderation`\n`/config antispam` • `/config links` • `/config invites`\n`/config raid-protection` • `/config account-age`' },
       )], files: [makeBanner()], flags: MessageFlags.Ephemeral });
       if (interaction.commandName === 'ping') return interaction.reply({ embeds: [baseEmbed().setTitle('Room 7 is Online').setDescription(`Everything is working normally.\n\n**Response time:** ${client.ws.ping}ms`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
     }
