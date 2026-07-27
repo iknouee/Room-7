@@ -39,6 +39,8 @@ const BANNER_NAME = 'room7-banner.png';
 const DATA_CHANNEL_NAME = 'room7-bot-data';
 const DATA_PREFIX = 'ROOM7_CONFIG:';
 const TIME_ZONE = 'Europe/London';
+const PORTAL_BANNER_URL = 'https://cdn.discordapp.com/attachments/1525775191152525332/1531111904854937690/image.png?ex=6a680694&is=6a66b514&hm=a693e867da6b1be4681055cb7c8c77f4d3cc69f4fc824445a03aedc563443eaa';
+const PORTAL_INVITE_URL = 'https://discord.gg/joinblvd';
 
 const defaultConfig = {
   colours: [],
@@ -302,6 +304,10 @@ const commands = [
     .addSubcommand((sub) => sub.setName('nominate').setDescription('Nominate a message using its link.')
       .addStringOption((option) => option.setName('message-link').setDescription('Discord message link.').setRequired(true)))
     .addSubcommand((sub) => sub.setName('pick').setDescription('Pick the most-starred nominated post in this channel.')),
+  new SlashCommandBuilder()
+    .setName('sendportal')
+    .setDescription('Post the Beloved partner portal advertisement.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('roles').setDescription('Open your private Room 7 role selector.'),
   new SlashCommandBuilder().setName('help').setDescription('View the Room 7 bot command guide.'),
   new SlashCommandBuilder().setName('ping').setDescription('Check the bot status and response time.'),
@@ -324,6 +330,30 @@ function baseEmbed() {
     .setColor(EMBED_COLOR)
     .setImage(`attachment://${BANNER_NAME}`)
     .setFooter({ text: 'Room 7 • Your place. Our people.' });
+}
+
+function portalEmbed() {
+  return new EmbedBuilder()
+    .setColor(0xF2A7C3)
+    .setTitle('୨ৎ Welcome to Beloved')
+    .setDescription([
+      '°❀⋆.ೃ࿔:･°❀⋆.ೃ࿔:°❀⋆.ೃ࿔:･°❀⋆.ೃ࿔:',
+      '',
+      'A friendly community made for meeting new people, having fun and making memories. 💗',
+      '',
+      '📣 **Pings** — `@here`',
+      '💬 **Social**',
+      '🫂 **BB Friend Group**',
+      '🎉 **Giveaways**',
+      '🎙️ **Hostings**',
+      '',
+      '👑 **Representatives:** @ari & @audrey',
+      '',
+      '──────────୨ৎ──────────',
+      `### [Join Beloved](${PORTAL_INVITE_URL})`,
+    ].join('\n'))
+    .setImage(PORTAL_BANNER_URL)
+    .setFooter({ text: 'Room 7 Portal • Partner Advertisement' });
 }
 
 function rolePanelEmbed() {
@@ -1427,13 +1457,22 @@ client.on('interactionCreate', async (interaction) => {
       if (['warn', 'warnings', 'clearwarnings', 'timeout', 'untimeout', 'kick', 'ban', 'unban', 'purge', 'slowmode', 'lock', 'unlock'].includes(interaction.commandName)) {
         return handleModerationCommand(interaction);
       }
+      if (interaction.commandName === 'sendportal') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await interaction.channel.send({
+          content: '@here',
+          embeds: [portalEmbed()],
+          allowedMentions: { parse: ['everyone'] },
+        });
+        return interaction.editReply('✅ The Beloved portal advertisement has been posted.');
+      }
       if (interaction.commandName === 'roles') return interaction.reply({ embeds: [rolePanelEmbed()], components: [panelButtons()], files: [makeBanner()], flags: MessageFlags.Ephemeral });
       if (interaction.commandName === 'help') return interaction.reply({ embeds: [baseEmbed().setTitle('Room 7 Bot Commands').addFields(
         { name: 'Member Commands', value: '`/roles` • `/rank` • `/leaderboard`\n`/rep` • `/reputation` • `/birthday`\n`/serverstats` • `/media nominate` • `/ping`' },
         { name: 'Staff Setup', value: '`/config add-color` • `/config add-ping`\n`/config welcome` • `/config qotd`\n`/config list` • `/setup roles`\n`/setup rules` • `/setup about`\n`/qotd post` — Post a question now' },
         { name: 'Moderation', value: '`/warn` • `/warnings` • `/clearwarnings`\n`/timeout` • `/untimeout` • `/kick` • `/ban` • `/unban`\n`/purge` • `/slowmode` • `/lock` • `/unlock`' },
         { name: 'Security Setup', value: '`/config modlogs` • `/config moderation`\n`/config antispam` • `/config links` • `/config invites`\n`/config raid-protection` • `/config account-age`' },
-        { name: 'Community Setup', value: '`/autorespond add` • `/autorespond remove` • `/autorespond list`\n`/config leveling` • `/config birthdays` • `/config milestones`\n`/event` • `/giveaway` • `/media pick`' },
+        { name: 'Community Setup', value: '`/autorespond add` • `/autorespond remove` • `/autorespond list`\n`/config leveling` • `/config birthdays` • `/config milestones`\n`/event` • `/giveaway` • `/media pick` • `/sendportal`' },
       )], files: [makeBanner()], flags: MessageFlags.Ephemeral });
       if (interaction.commandName === 'ping') return interaction.reply({ embeds: [baseEmbed().setTitle('Room 7 is Online').setDescription(`Everything is working normally.\n\n**Response time:** ${client.ws.ping}ms`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
     }
