@@ -58,6 +58,12 @@ const defaultConfig = {
     lockedChannels: {},
   },
   warnings: {},
+  autoresponders: [],
+  leveling: { enabled: true, xp: {} },
+  reputation: { users: {}, cooldowns: {} },
+  birthdays: { channelId: null, users: {}, lastCheckedDate: null },
+  milestones: { channelId: null, announced: [] },
+  giveaways: {},
 };
 
 const questions = [
@@ -97,7 +103,11 @@ let config = structuredClone(defaultConfig);
 let dataChannel = null;
 let dataMessages = [];
 let qotdTimer = null;
+let communityTimer = null;
+const giveawayTimers = new Map();
 const spamTracker = new Map();
+const xpCooldowns = new Map();
+let xpSaveTimer = null;
 const recentJoins = [];
 const invitePattern = /(?:https?:\/\/)?(?:www\.)?(?:discord(?:app)?\.com\/invite|discord\.gg)\/[a-z0-9-]+/i;
 const urlPattern = /https?:\/\/[^\s<]+/i;
@@ -178,6 +188,18 @@ const commands = [
         { name: 'Timeout for 24 hours', value: 'timeout' },
         { name: 'Kick from server', value: 'kick' },
       )))
+    .addSubcommand((sub) => sub
+      .setName('birthdays')
+      .setDescription('Choose where birthday announcements are posted.')
+      .addChannelOption((option) => option.setName('channel').setDescription('Birthday announcement channel.').addChannelTypes(ChannelType.GuildText).setRequired(true)))
+    .addSubcommand((sub) => sub
+      .setName('milestones')
+      .setDescription('Choose where member milestone announcements are posted.')
+      .addChannelOption((option) => option.setName('channel').setDescription('Milestone announcement channel.').addChannelTypes(ChannelType.GuildText).setRequired(true)))
+    .addSubcommand((sub) => sub
+      .setName('leveling')
+      .setDescription('Enable or disable the leveling system.')
+      .addBooleanOption((option) => option.setName('enabled').setDescription('Whether members earn XP from chatting.').setRequired(true)))
     .addSubcommand((sub) => sub.setName('list').setDescription('View the current bot configuration.'))
     .addSubcommand((sub) => sub
       .setName('clear')
@@ -232,6 +254,54 @@ const commands = [
     .addStringOption((option) => option.setName('reason').setDescription('Reason for locking the channel.').setMaxLength(500)),
   new SlashCommandBuilder().setName('unlock').setDescription('Unlock the current channel.').setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
     .addStringOption((option) => option.setName('reason').setDescription('Reason for unlocking the channel.').setMaxLength(500)),
+  new SlashCommandBuilder()
+    .setName('autorespond')
+    .setDescription('Manage automatic trigger replies.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand((sub) => sub.setName('add').setDescription('Add an automatic reply.')
+      .addStringOption((option) => option.setName('trigger').setDescription('Word or phrase to detect.').setRequired(true).setMaxLength(100))
+      .addStringOption((option) => option.setName('response').setDescription('What the bot should say.').setRequired(true).setMaxLength(1800)))
+    .addSubcommand((sub) => sub.setName('remove').setDescription('Remove an automatic reply.')
+      .addStringOption((option) => option.setName('trigger').setDescription('Trigger to remove.').setRequired(true).setMaxLength(100)))
+    .addSubcommand((sub) => sub.setName('list').setDescription('List every automatic reply.')),
+  new SlashCommandBuilder().setName('rank').setDescription('View your level or another member’s level.')
+    .addUserOption((option) => option.setName('member').setDescription('Member to view.')),
+  new SlashCommandBuilder().setName('leaderboard').setDescription('View the Room 7 XP leaderboard.'),
+  new SlashCommandBuilder().setName('rep').setDescription('Give a member one reputation point.')
+    .addUserOption((option) => option.setName('member').setDescription('Member to give reputation to.').setRequired(true)),
+  new SlashCommandBuilder().setName('reputation').setDescription('View reputation.')
+    .addUserOption((option) => option.setName('member').setDescription('Member to view.')),
+  new SlashCommandBuilder()
+    .setName('birthday')
+    .setDescription('Set or remove your birthday.')
+    .addSubcommand((sub) => sub.setName('set').setDescription('Set your birthday.')
+      .addIntegerOption((option) => option.setName('day').setDescription('Day of the month.').setRequired(true).setMinValue(1).setMaxValue(31))
+      .addIntegerOption((option) => option.setName('month').setDescription('Month number.').setRequired(true).setMinValue(1).setMaxValue(12)))
+    .addSubcommand((sub) => sub.setName('remove').setDescription('Remove your saved birthday.'))
+    .addSubcommand((sub) => sub.setName('list').setDescription('See upcoming birthdays.')),
+  new SlashCommandBuilder()
+    .setName('event')
+    .setDescription('Create a Room 7 event announcement.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents)
+    .addStringOption((option) => option.setName('title').setDescription('Event title.').setRequired(true).setMaxLength(100))
+    .addStringOption((option) => option.setName('when').setDescription('Date/time text, e.g. Friday 8 PM UK.').setRequired(true).setMaxLength(100))
+    .addStringOption((option) => option.setName('details').setDescription('Event details.').setRequired(true).setMaxLength(1000))
+    .addRoleOption((option) => option.setName('ping-role').setDescription('Optional role to ping.')),
+  new SlashCommandBuilder()
+    .setName('giveaway')
+    .setDescription('Start a button-entry giveaway.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents)
+    .addStringOption((option) => option.setName('prize').setDescription('Giveaway prize.').setRequired(true).setMaxLength(200))
+    .addIntegerOption((option) => option.setName('minutes').setDescription('Duration in minutes.').setRequired(true).setMinValue(1).setMaxValue(10080))
+    .addIntegerOption((option) => option.setName('winners').setDescription('Number of winners.').setMinValue(1).setMaxValue(10))
+    .addRoleOption((option) => option.setName('ping-role').setDescription('Optional role to ping.')),
+  new SlashCommandBuilder().setName('serverstats').setDescription('View live Room 7 server statistics.'),
+  new SlashCommandBuilder()
+    .setName('media')
+    .setDescription('Media of the Week tools.')
+    .addSubcommand((sub) => sub.setName('nominate').setDescription('Nominate a message using its link.')
+      .addStringOption((option) => option.setName('message-link').setDescription('Discord message link.').setRequired(true)))
+    .addSubcommand((sub) => sub.setName('pick').setDescription('Pick the most-starred nominated post in this channel.')),
   new SlashCommandBuilder().setName('roles').setDescription('Open your private Room 7 role selector.'),
   new SlashCommandBuilder().setName('help').setDescription('View the Room 7 bot command guide.'),
   new SlashCommandBuilder().setName('ping').setDescription('Check the bot status and response time.'),
@@ -397,6 +467,12 @@ async function ensureDataStore(guild) {
       config.moderation.accountAge = { ...defaultConfig.moderation.accountAge, ...(stored.moderation?.accountAge || {}) };
       config.moderation.lockedChannels = stored.moderation?.lockedChannels || {};
       config.warnings = stored.warnings && typeof stored.warnings === 'object' ? stored.warnings : {};
+      config.autoresponders = Array.isArray(stored.autoresponders) ? stored.autoresponders : [];
+      config.leveling = { ...defaultConfig.leveling, ...(stored.leveling || {}), xp: stored.leveling?.xp || {} };
+      config.reputation = { ...defaultConfig.reputation, ...(stored.reputation || {}), users: stored.reputation?.users || {}, cooldowns: stored.reputation?.cooldowns || {} };
+      config.birthdays = { ...defaultConfig.birthdays, ...(stored.birthdays || {}), users: stored.birthdays?.users || {} };
+      config.milestones = { ...defaultConfig.milestones, ...(stored.milestones || {}), announced: Array.isArray(stored.milestones?.announced) ? stored.milestones.announced : [] };
+      config.giveaways = stored.giveaways && typeof stored.giveaways === 'object' ? stored.giveaways : {};
     } catch (error) {
       console.error('Stored configuration was invalid; using defaults.', error);
       config = structuredClone(defaultConfig);
@@ -492,6 +568,296 @@ async function checkQotdSchedule() {
   }
 }
 
+
+function levelFromXp(xp) {
+  return Math.floor(Math.sqrt(Math.max(0, xp) / 100));
+}
+
+function xpForLevel(level) {
+  return level * level * 100;
+}
+
+async function awardXp(message) {
+  if (!config.leveling.enabled || !message.member) return;
+  const key = `${message.guild.id}:${message.author.id}`;
+  const now = Date.now();
+  if ((xpCooldowns.get(key) || 0) > now) return;
+  xpCooldowns.set(key, now + 60_000);
+  const before = Number(config.leveling.xp[message.author.id] || 0);
+  const gain = 15 + Math.floor(Math.random() * 11);
+  const after = before + gain;
+  config.leveling.xp[message.author.id] = after;
+  const oldLevel = levelFromXp(before);
+  const newLevel = levelFromXp(after);
+  if (newLevel > oldLevel) {
+    await message.channel.send({ content: `🎉 ${message.author}, you reached **Level ${newLevel}** in Room 7!`, allowedMentions: { users: [message.author.id] } }).catch(() => null);
+  }
+  if (!xpSaveTimer) {
+    xpSaveTimer = setTimeout(() => {
+      xpSaveTimer = null;
+      saveConfig().catch((error) => console.error('XP save error:', error));
+    }, 30_000);
+  }
+}
+
+function autoresponderMatch(content) {
+  const lower = content.toLowerCase();
+  return [...config.autoresponders]
+    .sort((a, b) => b.trigger.length - a.trigger.length)
+    .find((item) => {
+      const trigger = item.trigger.toLowerCase();
+      if (/^[a-z0-9_]+$/i.test(trigger)) {
+        return new RegExp(`(^|\\W)${trigger.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}(?=\\W|$)`, 'i').test(content);
+      }
+      return lower.includes(trigger);
+    });
+}
+
+async function checkBirthdays() {
+  if (!client.isReady() || !config.birthdays.channelId) return;
+  const now = londonParts();
+  const dateKey = `${now.year}-${now.month}-${now.day}`;
+  if (config.birthdays.lastCheckedDate === dateKey) return;
+  config.birthdays.lastCheckedDate = dateKey;
+  const day = Number(now.day);
+  const month = Number(now.month);
+  const birthdayIds = Object.entries(config.birthdays.users)
+    .filter(([, value]) => value.day === day && value.month === month)
+    .map(([id]) => id);
+  if (birthdayIds.length) {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const channel = await guild.channels.fetch(config.birthdays.channelId).catch(() => null);
+    if (channel?.isTextBased()) {
+      await channel.send({
+        content: birthdayIds.map((id) => `<@${id}>`).join(' '),
+        embeds: [baseEmbed().setTitle('🎂 Happy Birthday!').setDescription(`Everyone wish ${birthdayIds.map((id) => `<@${id}>`).join(', ')} a very happy birthday! 💗`)],
+        files: [makeBanner()],
+        allowedMentions: { users: birthdayIds },
+      });
+    }
+  }
+  await saveConfig();
+}
+
+async function announceMilestone(guild) {
+  if (!config.milestones.channelId) return;
+  const count = guild.memberCount;
+  const milestones = [25, 50, 100, 250, 500, 750, 1000, 2500, 5000, 10000];
+  const hit = milestones.find((value) => count >= value && !config.milestones.announced.includes(value));
+  if (!hit) return;
+  const channel = await guild.channels.fetch(config.milestones.channelId).catch(() => null);
+  if (channel?.isTextBased()) {
+    await channel.send({ embeds: [baseEmbed().setTitle(`🎉 ${hit.toLocaleString()} Members!`).setDescription(`Room 7 has officially reached **${hit.toLocaleString()} members**.\n\nThank you to everyone helping the community grow!`) ], files: [makeBanner()] });
+  }
+  config.milestones.announced.push(hit);
+  await saveConfig();
+}
+
+function giveawayButton(messageId, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`giveaway_enter:${messageId}`).setLabel('Enter Giveaway').setEmoji('🎉').setStyle(ButtonStyle.Primary).setDisabled(disabled),
+  );
+}
+
+async function endGiveaway(messageId) {
+  const data = config.giveaways[messageId];
+  if (!data || data.ended) return;
+  data.ended = true;
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const channel = await guild.channels.fetch(data.channelId).catch(() => null);
+  const message = channel?.isTextBased() ? await channel.messages.fetch(messageId).catch(() => null) : null;
+  const entrants = [...new Set(data.entrants || [])];
+  const shuffled = entrants.sort(() => Math.random() - 0.5);
+  const winners = shuffled.slice(0, Math.min(data.winners, shuffled.length));
+  if (message) {
+    const embed = EmbedBuilder.from(message.embeds[0] || new EmbedBuilder())
+      .setColor(EMBED_COLOR)
+      .setDescription(`**Prize:** ${data.prize}\n\n**Ended:** <t:${Math.floor(Date.now() / 1000)}:R>\n**Entries:** ${entrants.length}\n**Winner(s):** ${winners.length ? winners.map((id) => `<@${id}>`).join(', ') : 'No valid entries'}`);
+    await message.edit({ embeds: [embed], components: [giveawayButton(messageId, true)] }).catch(() => null);
+    await channel.send({ content: winners.length ? `🎉 Congratulations ${winners.map((id) => `<@${id}>`).join(', ')}! You won **${data.prize}**.` : `The giveaway for **${data.prize}** ended with no valid entries.`, allowedMentions: { users: winners } }).catch(() => null);
+  }
+  await saveConfig();
+}
+
+function scheduleGiveaway(messageId) {
+  const data = config.giveaways[messageId];
+  if (!data || data.ended) return;
+  if (giveawayTimers.has(messageId)) clearTimeout(giveawayTimers.get(messageId));
+  const delay = Math.max(0, data.endAt - Date.now());
+  const timer = setTimeout(() => endGiveaway(messageId).catch(console.error), Math.min(delay, 2_147_000_000));
+  giveawayTimers.set(messageId, timer);
+}
+
+async function restoreGiveaways() {
+  for (const [messageId, data] of Object.entries(config.giveaways)) {
+    if (!data.ended) {
+      if (data.endAt <= Date.now()) await endGiveaway(messageId);
+      else scheduleGiveaway(messageId);
+    }
+  }
+}
+
+async function handleCommunityCommand(interaction) {
+  const name = interaction.commandName;
+  if (name === 'autorespond') {
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'add') {
+      const trigger = interaction.options.getString('trigger', true).trim();
+      const response = interaction.options.getString('response', true).trim();
+      if (!trigger || !response) throw new Error('Trigger and response cannot be empty.');
+      const existing = config.autoresponders.find((item) => item.trigger.toLowerCase() === trigger.toLowerCase());
+      if (existing) existing.response = response;
+      else {
+        if (config.autoresponders.length >= 100) throw new Error('You can configure up to 100 autoresponders.');
+        config.autoresponders.push({ trigger, response });
+      }
+      await saveConfig();
+      return interaction.reply({ content: `✅ When someone says **${trigger}**, I will reply with:\n${response}`, flags: MessageFlags.Ephemeral });
+    }
+    if (sub === 'remove') {
+      const trigger = interaction.options.getString('trigger', true).trim();
+      const before = config.autoresponders.length;
+      config.autoresponders = config.autoresponders.filter((item) => item.trigger.toLowerCase() !== trigger.toLowerCase());
+      if (before === config.autoresponders.length) throw new Error('That trigger is not configured.');
+      await saveConfig();
+      return interaction.reply({ content: `✅ Removed the **${trigger}** autoresponder.`, flags: MessageFlags.Ephemeral });
+    }
+    const text = config.autoresponders.length
+      ? config.autoresponders.map((item, index) => `**${index + 1}. ${item.trigger}** → ${truncate(item.response, 100)}`).join('\n')
+      : '*No autoresponders configured.*';
+    return interaction.reply({ embeds: [baseEmbed().setTitle('Automatic Replies').setDescription(text)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
+  }
+
+  if (name === 'rank') {
+    const user = interaction.options.getUser('member') || interaction.user;
+    const xp = Number(config.leveling.xp[user.id] || 0);
+    const level = levelFromXp(xp);
+    const currentBase = xpForLevel(level);
+    const nextBase = xpForLevel(level + 1);
+    return interaction.reply({ embeds: [baseEmbed().setTitle(`${user.username}'s Rank`).setThumbnail(user.displayAvatarURL()).addFields(
+      { name: 'Level', value: String(level), inline: true },
+      { name: 'Total XP', value: xp.toLocaleString(), inline: true },
+      { name: 'Progress', value: `${xp - currentBase}/${nextBase - currentBase} XP`, inline: true },
+    )], files: [makeBanner()] });
+  }
+
+  if (name === 'leaderboard') {
+    const rows = Object.entries(config.leveling.xp).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    const text = rows.length ? rows.map(([id, xp], index) => `**${index + 1}.** <@${id}> — Level **${levelFromXp(xp)}** • ${Number(xp).toLocaleString()} XP`).join('\n') : '*No XP has been earned yet.*';
+    return interaction.reply({ embeds: [baseEmbed().setTitle('🏆 Room 7 Leaderboard').setDescription(text)], files: [makeBanner()], allowedMentions: { parse: [] } });
+  }
+
+  if (name === 'rep') {
+    const user = interaction.options.getUser('member', true);
+    if (user.id === interaction.user.id) throw new Error('You cannot give reputation to yourself.');
+    if (user.bot) throw new Error('You cannot give reputation to a bot.');
+    const last = Number(config.reputation.cooldowns[interaction.user.id] || 0);
+    if (Date.now() - last < 86_400_000) {
+      const next = Math.floor((last + 86_400_000) / 1000);
+      throw new Error(`You can give reputation again <t:${next}:R>.`);
+    }
+    config.reputation.cooldowns[interaction.user.id] = Date.now();
+    config.reputation.users[user.id] = Number(config.reputation.users[user.id] || 0) + 1;
+    await saveConfig();
+    return interaction.reply({ content: `💗 ${interaction.user} gave ${user} a reputation point! They now have **${config.reputation.users[user.id]} rep**.`, allowedMentions: { users: [interaction.user.id, user.id] } });
+  }
+
+  if (name === 'reputation') {
+    const user = interaction.options.getUser('member') || interaction.user;
+    return interaction.reply({ embeds: [baseEmbed().setTitle(`${user.username}'s Reputation`).setThumbnail(user.displayAvatarURL()).setDescription(`💗 **${Number(config.reputation.users[user.id] || 0)} reputation point(s)**`)], files: [makeBanner()] });
+  }
+
+  if (name === 'birthday') {
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'set') {
+      const day = interaction.options.getInteger('day', true);
+      const month = interaction.options.getInteger('month', true);
+      const test = new Date(2024, month - 1, day);
+      if (test.getMonth() !== month - 1 || test.getDate() !== day) throw new Error('That is not a valid calendar date.');
+      config.birthdays.users[interaction.user.id] = { day, month };
+      await saveConfig();
+      return interaction.reply({ content: `🎂 Your birthday is saved as **${day}/${month}**.`, flags: MessageFlags.Ephemeral });
+    }
+    if (sub === 'remove') {
+      delete config.birthdays.users[interaction.user.id];
+      await saveConfig();
+      return interaction.reply({ content: '✅ Your birthday has been removed.', flags: MessageFlags.Ephemeral });
+    }
+    const upcoming = Object.entries(config.birthdays.users).slice(0, 30).map(([id, value]) => `<@${id}> — **${value.day}/${value.month}**`).join('\n') || '*No birthdays saved yet.*';
+    return interaction.reply({ embeds: [baseEmbed().setTitle('🎂 Room 7 Birthdays').setDescription(upcoming)], files: [makeBanner()], allowedMentions: { parse: [] } });
+  }
+
+  if (name === 'event') {
+    const title = interaction.options.getString('title', true);
+    const when = interaction.options.getString('when', true);
+    const details = interaction.options.getString('details', true);
+    const role = interaction.options.getRole('ping-role');
+    await interaction.channel.send({
+      content: role ? `${role}` : '',
+      embeds: [baseEmbed().setTitle(`📅 ${title}`).setDescription(details).addFields({ name: 'When', value: when }, { name: 'Hosted by', value: `${interaction.user}` })],
+      files: [makeBanner()],
+      allowedMentions: role ? { roles: [role.id] } : { parse: [] },
+    });
+    return interaction.reply({ content: '✅ Event announcement posted.', flags: MessageFlags.Ephemeral });
+  }
+
+  if (name === 'giveaway') {
+    const prize = interaction.options.getString('prize', true);
+    const minutes = interaction.options.getInteger('minutes', true);
+    const winners = interaction.options.getInteger('winners') || 1;
+    const role = interaction.options.getRole('ping-role');
+    const endAt = Date.now() + minutes * 60_000;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const message = await interaction.channel.send({
+      content: role ? `${role}` : '',
+      embeds: [baseEmbed().setTitle('🎉 Room 7 Giveaway').setDescription(`**Prize:** ${prize}\n\nClick the button below to enter.\n**Ends:** <t:${Math.floor(endAt / 1000)}:R>\n**Winners:** ${winners}\n**Hosted by:** ${interaction.user}`)],
+      files: [makeBanner()],
+      allowedMentions: role ? { roles: [role.id] } : { parse: [] },
+    });
+    await message.edit({ components: [giveawayButton(message.id)] });
+    config.giveaways[message.id] = { channelId: interaction.channelId, prize, winners, endAt, entrants: [], ended: false };
+    await saveConfig();
+    scheduleGiveaway(message.id);
+    return interaction.editReply('✅ Giveaway started.');
+  }
+
+  if (name === 'serverstats') {
+    await interaction.guild.members.fetch().catch(() => null);
+    const humans = interaction.guild.members.cache.filter((member) => !member.user.bot).size;
+    const bots = interaction.guild.members.cache.filter((member) => member.user.bot).size;
+    return interaction.reply({ embeds: [baseEmbed().setTitle('📊 Room 7 Server Stats').addFields(
+      { name: 'Members', value: interaction.guild.memberCount.toLocaleString(), inline: true },
+      { name: 'People', value: humans.toLocaleString(), inline: true },
+      { name: 'Bots', value: bots.toLocaleString(), inline: true },
+      { name: 'Boosts', value: String(interaction.guild.premiumSubscriptionCount || 0), inline: true },
+      { name: 'Channels', value: String(interaction.guild.channels.cache.size), inline: true },
+      { name: 'Roles', value: String(interaction.guild.roles.cache.size), inline: true },
+      { name: 'Created', value: `<t:${Math.floor(interaction.guild.createdTimestamp / 1000)}:R>` },
+    )], files: [makeBanner()] });
+  }
+
+  if (name === 'media') {
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'nominate') {
+      const link = interaction.options.getString('message-link', true);
+      const match = link.match(/channels\/(\d+)\/(\d+)\/(\d+)/);
+      if (!match || match[1] !== interaction.guildId) throw new Error('Use a valid message link from this server.');
+      const channel = await interaction.guild.channels.fetch(match[2]).catch(() => null);
+      const target = channel?.isTextBased() ? await channel.messages.fetch(match[3]).catch(() => null) : null;
+      if (!target) throw new Error('That message could not be found.');
+      await target.react('⭐');
+      await target.reply({ content: `⭐ Nominated for **Media of the Week** by ${interaction.user}. React with ⭐ to vote!`, allowedMentions: { users: [interaction.user.id] } });
+      return interaction.reply({ content: '✅ Media nominated.', flags: MessageFlags.Ephemeral });
+    }
+    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) throw new Error('Only staff can pick Media of the Week.');
+    const messages = await interaction.channel.messages.fetch({ limit: 100 });
+    const candidates = messages.filter((message) => message.reactions.cache.get('⭐') && (message.attachments.size || message.embeds.length));
+    const winner = candidates.sort((a, b) => (b.reactions.cache.get('⭐')?.count || 0) - (a.reactions.cache.get('⭐')?.count || 0)).first();
+    if (!winner) throw new Error('No starred media posts were found in this channel.');
+    await interaction.channel.send({ embeds: [baseEmbed().setTitle('⭐ Media of the Week').setDescription(`Congratulations ${winner.author}!\n\n[View the winning post](${winner.url})\n\n**Votes:** ${winner.reactions.cache.get('⭐')?.count || 0}`)], files: [makeBanner()] });
+    return interaction.reply({ content: '✅ Media of the Week posted.', flags: MessageFlags.Ephemeral });
+  }
+}
 
 function truncate(value, length = 1000) {
   const text = String(value || 'Not provided');
@@ -760,6 +1126,23 @@ async function handleConfig(interaction) {
     await saveConfig();
     return interaction.reply({ embeds: [baseEmbed().setTitle('Question of the Day Configured').setDescription(`A random question will post in ${channel} every day at **${time} UK time**, pinging ${role}.`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
   }
+  if (subcommand === 'birthdays') {
+    const channel = interaction.options.getChannel('channel', true);
+    config.birthdays.channelId = channel.id;
+    await saveConfig();
+    return interaction.reply({ content: `✅ Birthday announcements will be posted in ${channel}.`, flags: MessageFlags.Ephemeral });
+  }
+  if (subcommand === 'milestones') {
+    const channel = interaction.options.getChannel('channel', true);
+    config.milestones.channelId = channel.id;
+    await saveConfig();
+    return interaction.reply({ content: `✅ Member milestones will be posted in ${channel}.`, flags: MessageFlags.Ephemeral });
+  }
+  if (subcommand === 'leveling') {
+    config.leveling.enabled = interaction.options.getBoolean('enabled', true);
+    await saveConfig();
+    return interaction.reply({ content: `✅ Leveling is now **${config.leveling.enabled ? 'enabled' : 'disabled'}**.`, flags: MessageFlags.Ephemeral });
+  }
   if (subcommand === 'moderation') {
     config.moderation.enabled = interaction.options.getBoolean('enabled', true);
     await saveConfig();
@@ -851,6 +1234,7 @@ async function handleConfig(interaction) {
       { name: '❓ Question of the Day', value: config.qotd.channelId ? `<#${config.qotd.channelId}> • <@&${config.qotd.roleId}> • **${config.qotd.time} UK**` : '*Not configured.*' },
       { name: '🛡️ Moderation', value: `AutoMod: **${config.moderation.enabled ? 'On' : 'Off'}**\nLogs: ${config.moderation.logChannelId ? `<#${config.moderation.logChannelId}>` : '*Not configured*'}\nAnti-spam: **${config.moderation.antispam.enabled ? 'On' : 'Off'}**\nLinks: **${config.moderation.links.enabled ? 'Blocked' : 'Allowed'}** • Invites: **${config.moderation.invites.enabled ? 'Blocked' : 'Allowed'}**` },
       { name: '🚨 Security', value: `Raid protection: **${config.moderation.raid.enabled ? 'On' : 'Off'}**\nNew-account check: **${config.moderation.accountAge.enabled ? `${config.moderation.accountAge.minimumDays}+ days (${config.moderation.accountAge.action})` : 'Off'}**` },
+      { name: '✨ Community', value: `Leveling: **${config.leveling.enabled ? 'On' : 'Off'}**\nAutoresponders: **${config.autoresponders.length}**\nBirthdays: ${config.birthdays.channelId ? `<#${config.birthdays.channelId}>` : '*Not configured*'}\nMilestones: ${config.milestones.channelId ? `<#${config.milestones.channelId}>` : '*Not configured*'}` },
     )],
     files: [makeBanner()],
     flags: MessageFlags.Ephemeral,
@@ -880,8 +1264,12 @@ client.once('ready', async () => {
     await ensureDataStore(guild);
     await deployCommands();
     if (qotdTimer) clearInterval(qotdTimer);
+    if (communityTimer) clearInterval(communityTimer);
     qotdTimer = setInterval(checkQotdSchedule, 30_000);
+    communityTimer = setInterval(() => checkBirthdays().catch(console.error), 60_000);
     await checkQotdSchedule();
+    await checkBirthdays();
+    await restoreGiveaways();
     console.log('Room 7 systems loaded successfully.');
   } catch (error) {
     console.error('Startup setup failed:', error);
@@ -926,6 +1314,7 @@ client.on('guildMemberAdd', async (member) => {
         await channel.send({ content: `${member}`, embeds: [welcomeEmbed(member)], files: [makeBanner()], allowedMentions: { users: [member.id] } });
       }
     }
+    await announceMilestone(member.guild);
   } catch (error) {
     console.error('Member join handling error:', error);
   }
@@ -933,8 +1322,16 @@ client.on('guildMemberAdd', async (member) => {
 
 client.on('messageCreate', async (message) => {
   try {
-    if (!message.guild || message.guild.id !== GUILD_ID || message.author.bot || !config.moderation.enabled) return;
-    if (!message.member || isStaff(message.member)) return;
+    if (!message.guild || message.guild.id !== GUILD_ID || message.author.bot) return;
+
+    if (!message.member) return;
+    const bypassModeration = !config.moderation.enabled || isStaff(message.member);
+    if (bypassModeration) {
+      await awardXp(message);
+      const auto = autoresponderMatch(message.content || '');
+      if (auto) await message.reply({ content: auto.response, allowedMentions: { repliedUser: false, parse: [] } }).catch(() => null);
+      return;
+    }
 
     const content = message.content || '';
     const mentionCount = message.mentions.users.size + message.mentions.roles.size;
@@ -984,10 +1381,15 @@ client.on('messageCreate', async (message) => {
         await addWarning(message.guild, message.author, null, 'Spam or repeated-message flooding', 'AutoMod: anti-spam');
         const notice = await message.channel.send({ content: `${message.author}, spam is not allowed. You have been timed out for ${spam.timeoutMinutes} minutes.`, allowedMentions: { users: [message.author.id] } }).catch(() => null);
         if (notice) setTimeout(() => notice.delete().catch(() => null), 7000);
+        return;
       }
     }
+
+    await awardXp(message);
+    const auto = autoresponderMatch(content);
+    if (auto) await message.reply({ content: auto.response, allowedMentions: { repliedUser: false, parse: [] } }).catch(() => null);
   } catch (error) {
-    console.error('AutoMod message error:', error);
+    console.error('Message handling error:', error);
   }
 });
 
@@ -995,6 +1397,9 @@ client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'config') return handleConfig(interaction);
+      if (['autorespond', 'rank', 'leaderboard', 'rep', 'reputation', 'birthday', 'event', 'giveaway', 'serverstats', 'media'].includes(interaction.commandName)) {
+        return handleCommunityCommand(interaction);
+      }
       if (interaction.commandName === 'setup') {
         const sub = interaction.options.getSubcommand();
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -1024,14 +1429,29 @@ client.on('interactionCreate', async (interaction) => {
       }
       if (interaction.commandName === 'roles') return interaction.reply({ embeds: [rolePanelEmbed()], components: [panelButtons()], files: [makeBanner()], flags: MessageFlags.Ephemeral });
       if (interaction.commandName === 'help') return interaction.reply({ embeds: [baseEmbed().setTitle('Room 7 Bot Commands').addFields(
-        { name: 'Member Commands', value: '`/roles` — Open your role selector\n`/ping` — Check the bot status' },
+        { name: 'Member Commands', value: '`/roles` • `/rank` • `/leaderboard`\n`/rep` • `/reputation` • `/birthday`\n`/serverstats` • `/media nominate` • `/ping`' },
         { name: 'Staff Setup', value: '`/config add-color` • `/config add-ping`\n`/config welcome` • `/config qotd`\n`/config list` • `/setup roles`\n`/setup rules` • `/setup about`\n`/qotd post` — Post a question now' },
         { name: 'Moderation', value: '`/warn` • `/warnings` • `/clearwarnings`\n`/timeout` • `/untimeout` • `/kick` • `/ban` • `/unban`\n`/purge` • `/slowmode` • `/lock` • `/unlock`' },
         { name: 'Security Setup', value: '`/config modlogs` • `/config moderation`\n`/config antispam` • `/config links` • `/config invites`\n`/config raid-protection` • `/config account-age`' },
+        { name: 'Community Setup', value: '`/autorespond add` • `/autorespond remove` • `/autorespond list`\n`/config leveling` • `/config birthdays` • `/config milestones`\n`/event` • `/giveaway` • `/media pick`' },
       )], files: [makeBanner()], flags: MessageFlags.Ephemeral });
       if (interaction.commandName === 'ping') return interaction.reply({ embeds: [baseEmbed().setTitle('Room 7 is Online').setDescription(`Everything is working normally.\n\n**Response time:** ${client.ws.ping}ms`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
     }
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('giveaway_enter:')) {
+        const messageId = interaction.customId.split(':')[1];
+        const data = config.giveaways[messageId];
+        if (!data || data.ended) return interaction.reply({ content: 'This giveaway has already ended.', flags: MessageFlags.Ephemeral });
+        data.entrants = Array.isArray(data.entrants) ? data.entrants : [];
+        if (data.entrants.includes(interaction.user.id)) {
+          data.entrants = data.entrants.filter((id) => id !== interaction.user.id);
+          await saveConfig();
+          return interaction.reply({ content: 'You have left the giveaway.', flags: MessageFlags.Ephemeral });
+        }
+        data.entrants.push(interaction.user.id);
+        await saveConfig();
+        return interaction.reply({ content: `🎉 You entered the giveaway for **${data.prize}**!`, flags: MessageFlags.Ephemeral });
+      }
       if (interaction.customId === 'room7_open_ping_roles') return openPrivateRoleSelector(interaction, 'ping');
       if (interaction.customId === 'room7_open_colour_roles') return openPrivateRoleSelector(interaction, 'colour');
     }
