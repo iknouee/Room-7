@@ -446,6 +446,140 @@ function pingMenu(member) {
   })));
 }
 
+async function fetchAllConfigMessages(channel, maxMessages = 1000) {
+  const collected = [];
+  let before;
+
+  while (collected.length < maxMessages) {
+    const batch = await channel.messages.fetch({
+      limit: Math.min(100, maxMessages - collected.length),
+      ...(before ? { before } : {}),
+    });
+    if (!batch.size) break;
+
+    collected.push(...batch.values());
+    before = batch.last().id;
+    if (batch.size < 100) break;
+  }
+
+  return collected
+    .filter((message) => message.author.id === client.user.id && message.content.startsWith(DATA_PREFIX))
+    .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+}
+
+function parseStoredConfigMessages(messages) {
+  const candidates = [];
+
+  // New storage format: ROOM7_CONFIG:v2:<snapshotId>:<index>:<total>:<json chunk>
+  const snapshots = new Map();
+  for (const message of messages) {
+    const match = message.content.match(/^ROOM7_CONFIG:v2:([^:]+):(\d+):(\d+):([\s\S]*)$/);
+    if (!match) continue;
+
+    const [, snapshotId, indexRaw, totalRaw, content] = match;
+    const index = Number(indexRaw);
+    const total = Number(totalRaw);
+    if (!Number.isInteger(index) || !Number.isInteger(total) || index < 1 || total < 1 || index > total) continue;
+
+    if (!snapshots.has(snapshotId)) snapshots.set(snapshotId, { total, chunks: new Map(), messages: [], timestamp: 0 });
+    const snapshot = snapshots.get(snapshotId);
+    if (snapshot.total !== total) continue;
+    snapshot.chunks.set(index, content);
+    snapshot.messages.push(message);
+    snapshot.timestamp = Math.max(snapshot.timestamp, message.createdTimestamp);
+  }
+
+  for (const [snapshotId, snapshot] of snapshots) {
+    if (snapshot.chunks.size !== snapshot.total) continue;
+    const complete = Array.from({ length: snapshot.total }, (_, offset) => snapshot.chunks.get(offset + 1));
+    if (complete.some((chunk) => typeof chunk !== 'string')) continue;
+    candidates.push({
+      format: 'v2',
+      snapshotId,
+      raw: complete.join(''),
+      messages: snapshot.messages,
+      timestamp: snapshot.timestamp,
+    });
+  }
+
+  // Old chunk format. Reconstruct separate sequential batches instead of mixing every old save together.
+  let current = null;
+  for (const message of messages) {
+    const match = message.content.match(/^ROOM7_CONFIG:(\d+):(\d+):([\s\S]*)$/);
+    if (!match) continue;
+
+    const index = Number(match[1]);
+    const total = Number(match[2]);
+    const content = match[3];
+
+    if (index === 1) current = { total, chunks: [content], messages: [message], timestamp: message.createdTimestamp };
+    else if (current && total === current.total && index === current.chunks.length + 1) {
+      current.chunks.push(content);
+      current.messages.push(message);
+      current.timestamp = message.createdTimestamp;
+    } else {
+      current = null;
+    }
+
+    if (current && current.chunks.length === current.total) {
+      candidates.push({
+        format: 'legacy-chunks',
+        raw: current.chunks.join(''),
+        messages: [...current.messages],
+        timestamp: current.timestamp,
+      });
+      current = null;
+    }
+  }
+
+  // Very old single-message format.
+  for (const message of messages) {
+    if (/^ROOM7_CONFIG:(?:v2:|\d+:\d+:)/.test(message.content)) continue;
+    candidates.push({
+      format: 'legacy-single',
+      raw: message.content.slice(DATA_PREFIX.length),
+      messages: [message],
+      timestamp: message.createdTimestamp,
+    });
+  }
+
+  // Use the newest complete snapshot that contains valid JSON.
+  candidates.sort((a, b) => b.timestamp - a.timestamp);
+  for (const candidate of candidates) {
+    try {
+      const stored = JSON.parse(candidate.raw);
+      if (!stored || typeof stored !== 'object' || Array.isArray(stored)) continue;
+      return { stored, candidate };
+    } catch (_) {}
+  }
+
+  return null;
+}
+
+function applyStoredConfig(stored) {
+  config = { ...structuredClone(defaultConfig), ...stored };
+  config.colours = Array.isArray(stored.colours) ? stored.colours : [];
+  config.pings = Array.isArray(stored.pings) ? stored.pings : [];
+  config.panel = { ...defaultConfig.panel, ...(stored.panel || {}) };
+  config.welcome = { ...defaultConfig.welcome, ...(stored.welcome || {}) };
+  config.qotd = { ...defaultConfig.qotd, ...(stored.qotd || {}) };
+  config.moderation = { ...structuredClone(defaultConfig.moderation), ...(stored.moderation || {}) };
+  config.moderation.antispam = { ...defaultConfig.moderation.antispam, ...(stored.moderation?.antispam || {}) };
+  config.moderation.links = { ...defaultConfig.moderation.links, ...(stored.moderation?.links || {}) };
+  config.moderation.invites = { ...defaultConfig.moderation.invites, ...(stored.moderation?.invites || {}) };
+  config.moderation.massMentions = { ...defaultConfig.moderation.massMentions, ...(stored.moderation?.massMentions || {}) };
+  config.moderation.raid = { ...defaultConfig.moderation.raid, ...(stored.moderation?.raid || {}) };
+  config.moderation.accountAge = { ...defaultConfig.moderation.accountAge, ...(stored.moderation?.accountAge || {}) };
+  config.moderation.lockedChannels = stored.moderation?.lockedChannels || {};
+  config.warnings = stored.warnings && typeof stored.warnings === 'object' ? stored.warnings : {};
+  config.autoresponders = Array.isArray(stored.autoresponders) ? stored.autoresponders : [];
+  config.leveling = { ...defaultConfig.leveling, ...(stored.leveling || {}), xp: stored.leveling?.xp || {} };
+  config.reputation = { ...defaultConfig.reputation, ...(stored.reputation || {}), users: stored.reputation?.users || {}, cooldowns: stored.reputation?.cooldowns || {} };
+  config.birthdays = { ...defaultConfig.birthdays, ...(stored.birthdays || {}), users: stored.birthdays?.users || {} };
+  config.milestones = { ...defaultConfig.milestones, ...(stored.milestones || {}), announced: Array.isArray(stored.milestones?.announced) ? stored.milestones.announced : [] };
+  config.giveaways = stored.giveaways && typeof stored.giveaways === 'object' ? stored.giveaways : {};
+}
+
 async function ensureDataStore(guild) {
   dataChannel = guild.channels.cache.find((channel) => channel.name === DATA_CHANNEL_NAME && channel.type === ChannelType.GuildText);
   if (!dataChannel) {
@@ -460,72 +594,55 @@ async function ensureDataStore(guild) {
     });
   }
 
-  const messages = await dataChannel.messages.fetch({ limit: 100 });
-  dataMessages = [...messages.values()].filter((message) => message.author.id === client.user.id && message.content.startsWith(DATA_PREFIX));
-  let raw = '';
-  const chunked = dataMessages.filter((message) => /^ROOM7_CONFIG:\d+:\d+:/.test(message.content));
-  if (chunked.length) {
-    raw = chunked
-      .map((message) => {
-        const match = message.content.match(/^ROOM7_CONFIG:(\d+):(\d+):([\s\S]*)$/);
-        return match ? { index: Number(match[1]), content: match[3] } : null;
-      })
-      .filter(Boolean)
-      .sort((a, b) => a.index - b.index)
-      .map((item) => item.content)
-      .join('');
-  } else {
-    const legacy = dataMessages.find((message) => message.content.startsWith(DATA_PREFIX));
-    if (legacy) raw = legacy.content.slice(DATA_PREFIX.length);
+  const allConfigMessages = await fetchAllConfigMessages(dataChannel);
+  const parsed = parseStoredConfigMessages(allConfigMessages);
+
+  if (parsed) {
+    applyStoredConfig(parsed.stored);
+    dataMessages = parsed.candidate.messages;
+    console.log(`Loaded Room 7 configuration (${parsed.candidate.format}): ${config.colours.length} color role(s), ${config.pings.length} ping role(s).`);
+
+    // Migrate old data into the safer snapshot format after it has loaded successfully.
+    if (parsed.candidate.format !== 'v2') await saveConfig();
+    return;
   }
 
-  if (raw) {
-    try {
-      const stored = JSON.parse(raw);
-      config = { ...structuredClone(defaultConfig), ...stored };
-      config.colours = Array.isArray(config.colours) ? config.colours : [];
-      config.pings = Array.isArray(config.pings) ? config.pings : [];
-      config.panel = { ...defaultConfig.panel, ...(stored.panel || {}) };
-      config.welcome = { ...defaultConfig.welcome, ...(stored.welcome || {}) };
-      config.qotd = { ...defaultConfig.qotd, ...(stored.qotd || {}) };
-      config.moderation = { ...structuredClone(defaultConfig.moderation), ...(stored.moderation || {}) };
-      config.moderation.antispam = { ...defaultConfig.moderation.antispam, ...(stored.moderation?.antispam || {}) };
-      config.moderation.links = { ...defaultConfig.moderation.links, ...(stored.moderation?.links || {}) };
-      config.moderation.invites = { ...defaultConfig.moderation.invites, ...(stored.moderation?.invites || {}) };
-      config.moderation.massMentions = { ...defaultConfig.moderation.massMentions, ...(stored.moderation?.massMentions || {}) };
-      config.moderation.raid = { ...defaultConfig.moderation.raid, ...(stored.moderation?.raid || {}) };
-      config.moderation.accountAge = { ...defaultConfig.moderation.accountAge, ...(stored.moderation?.accountAge || {}) };
-      config.moderation.lockedChannels = stored.moderation?.lockedChannels || {};
-      config.warnings = stored.warnings && typeof stored.warnings === 'object' ? stored.warnings : {};
-      config.autoresponders = Array.isArray(stored.autoresponders) ? stored.autoresponders : [];
-      config.leveling = { ...defaultConfig.leveling, ...(stored.leveling || {}), xp: stored.leveling?.xp || {} };
-      config.reputation = { ...defaultConfig.reputation, ...(stored.reputation || {}), users: stored.reputation?.users || {}, cooldowns: stored.reputation?.cooldowns || {} };
-      config.birthdays = { ...defaultConfig.birthdays, ...(stored.birthdays || {}), users: stored.birthdays?.users || {} };
-      config.milestones = { ...defaultConfig.milestones, ...(stored.milestones || {}), announced: Array.isArray(stored.milestones?.announced) ? stored.milestones.announced : [] };
-      config.giveaways = stored.giveaways && typeof stored.giveaways === 'object' ? stored.giveaways : {};
-    } catch (error) {
-      console.error('Stored configuration was invalid; using defaults.', error);
-      config = structuredClone(defaultConfig);
-    }
-  } else {
-    config = structuredClone(defaultConfig);
-    await saveConfig();
+  if (allConfigMessages.length) {
+    // Never silently overwrite a populated data channel with blank defaults.
+    throw new Error(`Found ${allConfigMessages.length} config message(s), but no complete valid configuration snapshot could be read. The existing messages were left untouched.`);
   }
+
+  config = structuredClone(defaultConfig);
+  dataMessages = [];
+  await saveConfig();
+  console.log('Created a new Room 7 configuration store.');
 }
 
 async function saveConfig() {
   if (!dataChannel) throw new Error('The configuration store is unavailable.');
+
   const json = JSON.stringify(config);
-  const chunkSize = 1750;
+  const chunkSize = 1650;
   const chunks = [];
   for (let index = 0; index < json.length; index += chunkSize) chunks.push(json.slice(index, index + chunkSize));
 
-  const oldMessages = [...dataMessages];
-  dataMessages = [];
+  const snapshotId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const newMessages = [];
+
+  // Write and verify the complete new snapshot before removing the previous one.
   for (let index = 0; index < chunks.length; index += 1) {
-    const message = await dataChannel.send(`${DATA_PREFIX}${index + 1}:${chunks.length}:${chunks[index]}`);
-    dataMessages.push(message);
+    const message = await dataChannel.send(`${DATA_PREFIX}v2:${snapshotId}:${index + 1}:${chunks.length}:${chunks[index]}`);
+    newMessages.push(message);
   }
+
+  const verification = parseStoredConfigMessages(newMessages);
+  if (!verification || verification.candidate.snapshotId !== snapshotId) {
+    await Promise.all(newMessages.map((message) => message.delete().catch(() => null)));
+    throw new Error('The new configuration snapshot could not be verified, so the previous configuration was kept.');
+  }
+
+  const oldMessages = [...dataMessages];
+  dataMessages = newMessages;
   await Promise.all(oldMessages.map((message) => message.delete().catch(() => null)));
 }
 
