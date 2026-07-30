@@ -132,6 +132,8 @@ let configSaveQueued = false;
 let configSaveRunning = false;
 let configSaveChain = Promise.resolve();
 const recentJoins = [];
+const lastToLeaveDisconnecting = new Set();
+const lastToLeaveLeaveHandlers = new Set();
 const invitePattern = /(?:https?:\/\/)?(?:www\.)?(?:discord(?:app)?\.com\/invite|discord\.gg)\/[a-z0-9-]+/i;
 const urlPattern = /https?:\/\/[^\s<]+/i;
 
@@ -1148,20 +1150,66 @@ async function startActivityCheck(guild, source = 'automatic') {
 async function eliminateContestant(guild, userId, reason = 'Did not complete the activity check', disconnect = true) {
   const settings = lastToLeaveSettings();
   if (!settings.contestants.includes(userId)) return false;
-  const member = guild.members.cache.get(userId)
-    || await withTimeout(guild.members.fetch(userId), 8000, 'Fetching the contestant').catch(() => null);
-  if (disconnect && member?.voice?.channelId === settings.voiceChannelId) {
-    if (!member.voice.disconnectable) throw new Error(`I cannot disconnect ${member.user.tag}. Give the bot Move Members and place its role high enough.`);
-    await withTimeout(member.voice.disconnect(reason), 10000, `Disconnecting ${member.user.tag}`);
+
+  console.log(`[LastToLeave] Eliminating ${userId}. disconnect=${disconnect}, role=${settings.contestantRoleId || 'none'}`);
+
+  let member = guild.members.cache.get(userId) || null;
+  if (!member) {
+    member = await withTimeout(guild.members.fetch(userId), 8000, 'Fetching the contestant');
   }
-  if (settings.contestantRoleId && member?.roles.cache.has(settings.contestantRoleId)) {
-    await withTimeout(member.roles.remove(settings.contestantRoleId, reason), 10000, `Removing the contestant role from ${member.user.tag}`)
-      .catch((error) => console.error('Contestant role removal error:', error));
+  if (!member) throw new Error('That contestant could not be found in the server.');
+
+  // Refresh the member so voice and role state are current before acting.
+  member = await withTimeout(guild.members.fetch({ user: userId, force: true }), 8000, 'Refreshing the contestant')
+    .catch(() => member);
+
+  const botMember = guild.members.me;
+  if (!botMember) throw new Error('The bot member could not be resolved in this server.');
+
+  if (settings.contestantRoleId && member.roles.cache.has(settings.contestantRoleId)) {
+    const role = guild.roles.cache.get(settings.contestantRoleId);
+    if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) {
+      throw new Error('I need the **Manage Roles** permission to remove the contestant role.');
+    }
+    if (!role) throw new Error('The configured contestant role no longer exists. Run `/lasttoleave setup` again.');
+    if (role.managed || role.position >= botMember.roles.highest.position) {
+      throw new Error(`Move my bot role above **${role.name}** so I can remove it.`);
+    }
+    console.log(`[LastToLeave] Removing contestant role from ${member.user.tag}.`);
+    await withTimeout(member.roles.remove(role, reason), 10000, `Removing the contestant role from ${member.user.tag}`);
+    console.log(`[LastToLeave] Contestant role removed from ${member.user.tag}.`);
   }
+
+  if (disconnect) {
+    // Fetch the current voice state directly; cached member data can be stale after a deploy.
+    const voiceState = guild.voiceStates.cache.get(userId) || member.voice;
+    const currentChannelId = voiceState?.channelId || member.voice?.channelId || null;
+    console.log(`[LastToLeave] ${member.user.tag} current VC=${currentChannelId || 'none'}, event VC=${settings.voiceChannelId}`);
+
+    if (currentChannelId === settings.voiceChannelId) {
+      if (!botMember.permissions.has(PermissionFlagsBits.MoveMembers)) {
+        throw new Error('I need the **Move Members** permission to disconnect contestants from the VC.');
+      }
+      if (!member.voice.disconnectable) {
+        throw new Error(`I cannot disconnect **${member.user.tag}**. Give me **Move Members** and place my bot role above their highest role.`);
+      }
+      console.log(`[LastToLeave] Disconnecting ${member.user.tag} from the event VC.`);
+      lastToLeaveDisconnecting.add(userId);
+      try {
+        await withTimeout(member.voice.setChannel(null, reason), 10000, `Disconnecting ${member.user.tag}`);
+      } finally {
+        // Keep this briefly so the VoiceStateUpdate caused by our own disconnect is ignored.
+        setTimeout(() => lastToLeaveDisconnecting.delete(userId), 3000);
+      }
+      console.log(`[LastToLeave] Disconnected ${member.user.tag}.`);
+    }
+  }
+
   settings.contestants = settings.contestants.filter((id) => id !== userId);
   if (!settings.eliminated.some((entry) => entry.userId === userId)) {
     settings.eliminated.push({ userId, reason, eliminatedAt: Date.now(), placement: settings.contestants.length + 1 });
   }
+  console.log(`[LastToLeave] ${member.user.tag} marked eliminated. ${settings.contestants.length} contestant(s) remain.`);
   return true;
 }
 
@@ -1325,9 +1373,10 @@ async function handleLastToLeaveCommand(interaction) {
     const reason = interaction.options.getString('reason') || `Manually eliminated by ${interaction.user.tag}`;
     await interaction.editReply(`⏳ Eliminating **${user.tag}**...`);
     if (!await eliminateContestant(interaction.guild, user.id, reason, true)) throw new Error('That member is not an active contestant.');
-    await saveConfig();
+    await interaction.editReply(`❌ **${user.tag}** was disconnected, had the contestant role removed, and was eliminated. **${settings.contestants.length}** remain.`);
+    queueConfigSave();
     sendLastToLeaveLog(interaction.guild, 'Contestant Manually Eliminated', `${user.tag} (${user.id})\nReason: ${reason}\nRemaining: ${settings.contestants.length}`).catch((error) => console.error('Last to Leave log error:', error));
-    return interaction.editReply(`❌ **${user.tag}** was disconnected and eliminated. **${settings.contestants.length}** remain.`);
+    return;
   }
 
   if (sub === 'restore') {
@@ -2075,6 +2124,63 @@ client.on('messageCreate', async (message) => {
     if (auto) await message.reply({ content: auto.response, allowedMentions: { repliedUser: false, parse: [] } }).catch(() => null);
   } catch (error) {
     console.error('Message handling error:', error);
+  }
+});
+
+
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  try {
+    const settings = lastToLeaveSettings();
+    const userId = oldState.id;
+
+    // Only act when an active contestant leaves or moves out of the configured event VC.
+    if (!settings.active || settings.paused) return;
+    if (!settings.voiceChannelId || oldState.channelId !== settings.voiceChannelId) return;
+    if (newState.channelId === settings.voiceChannelId) return;
+    if (!settings.contestants.includes(userId)) return;
+
+    // Ignore voice changes created by the bot's own /eliminate or activity-check removal.
+    if (lastToLeaveDisconnecting.has(userId) || lastToLeaveLeaveHandlers.has(userId)) return;
+    lastToLeaveLeaveHandlers.add(userId);
+
+    const member = newState.member || oldState.member || await oldState.guild.members.fetch(userId).catch(() => null);
+    const displayName = member?.user?.tag || userId;
+    const destination = newState.channel ? `moved to ${newState.channel.name}` : 'left the VC';
+    const reason = `Left the Last to Leave event VC (${destination})`;
+
+    console.log(`[LastToLeave] ${displayName} left the event VC and will be automatically eliminated.`);
+    const eliminated = await eliminateContestant(oldState.guild, userId, reason, false);
+    if (!eliminated) return;
+
+    await saveConfig();
+
+    const activityChannel = oldState.guild.channels.cache.get(settings.activityChannelId)
+      || await oldState.guild.channels.fetch(settings.activityChannelId).catch(() => null);
+    if (activityChannel?.isTextBased()) {
+      await activityChannel.send({
+        embeds: [new EmbedBuilder()
+          .setColor(0xE74C3C)
+          .setTitle('❌ Contestant Eliminated')
+          .setDescription(`<@${userId}> left the event VC and has been eliminated.
+
+**${settings.contestants.length} contestant(s) remain.**`)
+          .setTimestamp()
+          .setFooter({ text: 'Room 7 • Last to Leave VC' })],
+        allowedMentions: { users: [userId] },
+      }).catch(() => null);
+    }
+
+    await sendLastToLeaveLog(
+      oldState.guild,
+      'Contestant Left Event VC',
+      `${displayName} (${userId}) was automatically eliminated.
+Reason: ${destination}
+Remaining: **${settings.contestants.length}**`,
+    ).catch((error) => console.error('Last to Leave log error:', error));
+  } catch (error) {
+    console.error('[LastToLeave] Voice leave elimination error:', error);
+  } finally {
+    lastToLeaveLeaveHandlers.delete(oldState.id);
   }
 });
 
