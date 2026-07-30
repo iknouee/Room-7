@@ -67,6 +67,22 @@ const defaultConfig = {
   birthdays: { channelId: null, users: {}, lastCheckedDate: null },
   milestones: { channelId: null, announced: [] },
   giveaways: {},
+  lastToLeave: {
+    voiceChannelId: null,
+    activityChannelId: null,
+    logChannelId: null,
+    contestantRoleId: null,
+    active: false,
+    paused: false,
+    startedAt: null,
+    checkIntervalMinutes: 60,
+    responseWindowMinutes: 30,
+    checkNumber: 0,
+    nextCheckAt: null,
+    contestants: [],
+    eliminated: [],
+    currentCheck: null,
+  },
 };
 
 const questions = [
@@ -107,6 +123,7 @@ let dataChannel = null;
 let dataMessages = [];
 let qotdTimer = null;
 let communityTimer = null;
+let lastToLeaveTimer = null;
 const giveawayTimers = new Map();
 const spamTracker = new Map();
 const xpCooldowns = new Map();
@@ -311,6 +328,32 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName('roles').setDescription('Open your private Room 7 role selector.'),
   new SlashCommandBuilder().setName('help').setDescription('View the Room 7 bot command guide.'),
+  new SlashCommandBuilder()
+    .setName('lasttoleave')
+    .setDescription('Manage the Room 7 Last to Leave VC event.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageEvents)
+    .addSubcommand((sub) => sub
+      .setName('setup')
+      .setDescription('Configure the event channels and optional contestant role.')
+      .addChannelOption((option) => option.setName('voice-channel').setDescription('The event voice channel.').addChannelTypes(ChannelType.GuildVoice).setRequired(true))
+      .addChannelOption((option) => option.setName('activity-channel').setDescription('Where activity checks are posted.').addChannelTypes(ChannelType.GuildText).setRequired(true))
+      .addRoleOption((option) => option.setName('contestant-role').setDescription('Optional role given to contestants.'))
+      .addChannelOption((option) => option.setName('log-channel').setDescription('Optional private event log channel.').addChannelTypes(ChannelType.GuildText)))
+    .addSubcommand((sub) => sub.setName('start').setDescription('Start the event with everyone currently in the configured VC.'))
+    .addSubcommand((sub) => sub.setName('check-now').setDescription('Start a 30-minute activity check immediately.'))
+    .addSubcommand((sub) => sub.setName('status').setDescription('View the live event status and remaining contestants.'))
+    .addSubcommand((sub) => sub.setName('pause').setDescription('Pause automatic hourly activity checks.'))
+    .addSubcommand((sub) => sub.setName('resume').setDescription('Resume automatic hourly activity checks.'))
+    .addSubcommand((sub) => sub.setName('end').setDescription('End the event and close any active check.'))
+    .addSubcommand((sub) => sub
+      .setName('eliminate')
+      .setDescription('Manually eliminate and disconnect a contestant.')
+      .addUserOption((option) => option.setName('member').setDescription('Contestant to eliminate.').setRequired(true))
+      .addStringOption((option) => option.setName('reason').setDescription('Reason for elimination.').setMaxLength(300)))
+    .addSubcommand((sub) => sub
+      .setName('restore')
+      .setDescription('Restore a contestant after a mistake or disconnect.')
+      .addUserOption((option) => option.setName('member').setDescription('Contestant to restore.').setRequired(true))),
   new SlashCommandBuilder().setName('ping').setDescription('Check the bot status and response time.'),
 ].map((command) => command.toJSON());
 
@@ -320,6 +363,7 @@ const client = new Client({ intents: [
   GatewayIntentBits.GuildMessages,
   GatewayIntentBits.MessageContent,
   GatewayIntentBits.GuildModeration,
+  GatewayIntentBits.GuildVoiceStates,
 ] });
 
 function makeBanner() {
@@ -632,6 +676,10 @@ function applyStoredConfig(stored) {
   config.birthdays = { ...defaultConfig.birthdays, ...(stored.birthdays || {}), users: stored.birthdays?.users || {} };
   config.milestones = { ...defaultConfig.milestones, ...(stored.milestones || {}), announced: Array.isArray(stored.milestones?.announced) ? stored.milestones.announced : [] };
   config.giveaways = stored.giveaways && typeof stored.giveaways === 'object' ? stored.giveaways : {};
+  config.lastToLeave = { ...structuredClone(defaultConfig.lastToLeave), ...(stored.lastToLeave || {}) };
+  config.lastToLeave.contestants = Array.isArray(stored.lastToLeave?.contestants) ? stored.lastToLeave.contestants : [];
+  config.lastToLeave.eliminated = Array.isArray(stored.lastToLeave?.eliminated) ? stored.lastToLeave.eliminated : [];
+  config.lastToLeave.currentCheck = stored.lastToLeave?.currentCheck && typeof stored.lastToLeave.currentCheck === 'object' ? stored.lastToLeave.currentCheck : null;
 }
 
 async function ensureDataStore(guild) {
@@ -896,6 +944,321 @@ async function restoreGiveaways() {
       else scheduleGiveaway(messageId);
     }
   }
+}
+
+
+function lastToLeaveSettings() {
+  config.lastToLeave = { ...structuredClone(defaultConfig.lastToLeave), ...(config.lastToLeave || {}) };
+  config.lastToLeave.contestants = Array.isArray(config.lastToLeave.contestants) ? config.lastToLeave.contestants : [];
+  config.lastToLeave.eliminated = Array.isArray(config.lastToLeave.eliminated) ? config.lastToLeave.eliminated : [];
+  return config.lastToLeave;
+}
+
+function activityCheckButton(checkNumber, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`lasttoleave_active:${checkNumber}`)
+      .setLabel(disabled ? 'Activity Check Closed' : "I'm Active")
+      .setEmoji(disabled ? '🔒' : '✅')
+      .setStyle(disabled ? ButtonStyle.Secondary : ButtonStyle.Success)
+      .setDisabled(disabled),
+  );
+}
+
+function mentionList(ids, limit = 40) {
+  if (!ids?.length) return '*Nobody*';
+  const shown = ids.slice(0, limit).map((id) => `<@${id}>`).join(', ');
+  return ids.length > limit ? `${shown}\n…and **${ids.length - limit} more**` : shown;
+}
+
+async function sendLastToLeaveLog(guild, title, description) {
+  const settings = lastToLeaveSettings();
+  if (!settings.logChannelId) return;
+  const channel = await guild.channels.fetch(settings.logChannelId).catch(() => null);
+  if (!channel?.isTextBased()) return;
+  await channel.send({
+    embeds: [new EmbedBuilder().setColor(EMBED_COLOR).setTitle(title).setDescription(description).setTimestamp().setFooter({ text: 'Room 7 • Last to Leave VC' })],
+    allowedMentions: { parse: [] },
+  }).catch(() => null);
+}
+
+async function getEventVoiceChannel(guild) {
+  const settings = lastToLeaveSettings();
+  if (!settings.voiceChannelId) return null;
+  const channel = await guild.channels.fetch(settings.voiceChannelId).catch(() => null);
+  return channel?.type === ChannelType.GuildVoice ? channel : null;
+}
+
+async function updateActivityCheckMessage(guild, closed = false) {
+  const settings = lastToLeaveSettings();
+  const check = settings.currentCheck;
+  if (!check?.messageId || !check.channelId) return;
+  const channel = await guild.channels.fetch(check.channelId).catch(() => null);
+  const message = channel?.isTextBased() ? await channel.messages.fetch(check.messageId).catch(() => null) : null;
+  if (!message) return;
+  const responded = Array.isArray(check.responded) ? check.responded : [];
+  const eligible = Array.isArray(check.eligible) ? check.eligible : [];
+  const waiting = eligible.filter((id) => !responded.includes(id));
+  const endUnix = Math.floor(check.endsAt / 1000);
+  const embed = new EmbedBuilder()
+    .setColor(closed ? 0x7F8C8D : EMBED_COLOR)
+    .setTitle(`${closed ? '🔒' : '⚠️'} Activity Check #${check.number}${closed ? ' Closed' : ''}`)
+    .setDescription(closed
+      ? `This activity check has ended.\n\n**Responded:** ${responded.length}/${eligible.length}`
+      : `Press **I'm Active** before <t:${endUnix}:R>.\n\nAnyone who does not respond within **30 minutes** will be disconnected from the event VC and disqualified.`)
+    .addFields(
+      { name: '✅ Responded', value: `${responded.length}/${eligible.length}`, inline: true },
+      { name: '⏳ Waiting', value: String(waiting.length), inline: true },
+      { name: closed ? 'Ended' : 'Closes', value: `<t:${endUnix}:${closed ? 'R' : 'T'}>`, inline: true },
+    )
+    .setFooter({ text: 'Room 7 • Last to Leave VC' })
+    .setTimestamp();
+  await message.edit({ embeds: [embed], components: [activityCheckButton(check.number, closed)] }).catch(() => null);
+}
+
+async function startActivityCheck(guild, source = 'automatic') {
+  const settings = lastToLeaveSettings();
+  if (!settings.active) throw new Error('The Last to Leave event is not active.');
+  if (settings.paused && source === 'automatic') return false;
+  if (settings.currentCheck && !settings.currentCheck.closed) throw new Error('An activity check is already running.');
+
+  const voiceChannel = await getEventVoiceChannel(guild);
+  if (!voiceChannel) throw new Error('The configured event voice channel could not be found. Run `/lasttoleave setup` again.');
+  const activityChannel = await guild.channels.fetch(settings.activityChannelId).catch(() => null);
+  if (!activityChannel?.isTextBased()) throw new Error('The configured activity-check channel could not be found.');
+
+  const contestantSet = new Set(settings.contestants);
+  const eligible = [...voiceChannel.members.values()]
+    .filter((member) => !member.user.bot && contestantSet.has(member.id))
+    .map((member) => member.id);
+
+  settings.checkNumber += 1;
+  const startedAt = Date.now();
+  const endsAt = startedAt + settings.responseWindowMinutes * 60_000;
+  const check = {
+    number: settings.checkNumber,
+    source,
+    channelId: activityChannel.id,
+    messageId: null,
+    startedAt,
+    endsAt,
+    eligible,
+    responded: [],
+    closed: false,
+  };
+  settings.currentCheck = check;
+  settings.nextCheckAt = startedAt + settings.checkIntervalMinutes * 60_000;
+
+  const message = await activityChannel.send({
+    content: eligible.length ? eligible.map((id) => `<@${id}>`).join(' ') : '',
+    embeds: [new EmbedBuilder()
+      .setColor(EMBED_COLOR)
+      .setTitle(`⚠️ Activity Check #${check.number}`)
+      .setDescription(`Press **I'm Active** within **30 minutes**.\n\nAnyone who does not respond will be disconnected from <#${voiceChannel.id}> and disqualified.`)
+      .addFields(
+        { name: '✅ Responded', value: `0/${eligible.length}`, inline: true },
+        { name: '⏳ Waiting', value: String(eligible.length), inline: true },
+        { name: 'Closes', value: `<t:${Math.floor(endsAt / 1000)}:R>`, inline: true },
+      )
+      .setFooter({ text: 'Room 7 • Last to Leave VC' })
+      .setTimestamp()],
+    components: [activityCheckButton(check.number)],
+    allowedMentions: { users: eligible },
+  });
+  check.messageId = message.id;
+  await saveConfig();
+  await sendLastToLeaveLog(guild, `Activity Check #${check.number} Started`, `Eligible contestants: **${eligible.length}**\nCloses: <t:${Math.floor(endsAt / 1000)}:F>\nStarted by: **${source}**`);
+  return true;
+}
+
+async function eliminateContestant(guild, userId, reason = 'Did not complete the activity check', disconnect = true) {
+  const settings = lastToLeaveSettings();
+  if (!settings.contestants.includes(userId)) return false;
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (disconnect && member?.voice?.channelId === settings.voiceChannelId && member.voice.disconnectable) {
+    await member.voice.disconnect(reason).catch(() => null);
+  }
+  if (settings.contestantRoleId && member?.roles.cache.has(settings.contestantRoleId)) {
+    await member.roles.remove(settings.contestantRoleId, reason).catch(() => null);
+  }
+  settings.contestants = settings.contestants.filter((id) => id !== userId);
+  if (!settings.eliminated.some((entry) => entry.userId === userId)) {
+    settings.eliminated.push({ userId, reason, eliminatedAt: Date.now(), placement: settings.contestants.length + 1 });
+  }
+  return true;
+}
+
+async function closeActivityCheck(guild, reason = 'timer') {
+  const settings = lastToLeaveSettings();
+  const check = settings.currentCheck;
+  if (!check || check.closed) return;
+  check.closed = true;
+  const responded = Array.isArray(check.responded) ? check.responded : [];
+  const eligible = Array.isArray(check.eligible) ? check.eligible : [];
+  const failed = eligible.filter((id) => !responded.includes(id));
+  const eliminated = [];
+  for (const userId of failed) {
+    if (await eliminateContestant(guild, userId, `Failed Activity Check #${check.number}`, true)) eliminated.push(userId);
+  }
+
+  await updateActivityCheckMessage(guild, true);
+  const channel = await guild.channels.fetch(check.channelId).catch(() => null);
+  if (channel?.isTextBased()) {
+    await channel.send({
+      embeds: [new EmbedBuilder()
+        .setColor(eliminated.length ? 0xE74C3C : 0x57C785)
+        .setTitle(`Activity Check #${check.number} Complete`)
+        .setDescription([
+          `✅ **Passed:** ${responded.length}`,
+          `❌ **Disqualified:** ${eliminated.length}`,
+          `🎙️ **Contestants remaining:** ${settings.contestants.length}`,
+          '',
+          eliminated.length ? `**Removed from the VC:**\n${mentionList(eliminated)}` : '**Everyone responded in time!**',
+        ].join('\n'))
+        .setFooter({ text: 'Room 7 • Last to Leave VC' })
+        .setTimestamp()],
+      allowedMentions: { users: eliminated },
+    }).catch(() => null);
+  }
+  await sendLastToLeaveLog(guild, `Activity Check #${check.number} Completed`, `Passed: **${responded.length}**\nDisqualified: **${eliminated.length}**\nRemaining: **${settings.contestants.length}**\nClosed by: **${reason}**`);
+  await saveConfig();
+}
+
+async function processLastToLeaveSchedule() {
+  if (!client.isReady()) return;
+  const settings = lastToLeaveSettings();
+  if (!settings.active) return;
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  if (!guild) return;
+  const now = Date.now();
+  if (settings.currentCheck && !settings.currentCheck.closed && now >= settings.currentCheck.endsAt) {
+    await closeActivityCheck(guild, '30-minute timer');
+    return;
+  }
+  if (!settings.paused && (!settings.currentCheck || settings.currentCheck.closed) && settings.nextCheckAt && now >= settings.nextCheckAt) {
+    await startActivityCheck(guild, 'automatic');
+  }
+}
+
+async function handleLastToLeaveCommand(interaction) {
+  if (!await safelyDeferReply(interaction, { flags: MessageFlags.Ephemeral })) return;
+  const settings = lastToLeaveSettings();
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === 'setup') {
+    const voice = interaction.options.getChannel('voice-channel', true);
+    const activity = interaction.options.getChannel('activity-channel', true);
+    const role = interaction.options.getRole('contestant-role');
+    const log = interaction.options.getChannel('log-channel');
+    if (role) validateAssignableRole(interaction.guild, role);
+    settings.voiceChannelId = voice.id;
+    settings.activityChannelId = activity.id;
+    settings.contestantRoleId = role?.id || null;
+    settings.logChannelId = log?.id || null;
+    settings.checkIntervalMinutes = 60;
+    settings.responseWindowMinutes = 30;
+    await saveConfig();
+    return interaction.editReply(`✅ Last to Leave configured.\n\n**Event VC:** ${voice}\n**Activity checks:** ${activity}\n**Contestant role:** ${role || 'None'}\n**Checks:** Every hour, open for 30 minutes.`);
+  }
+
+  if (sub === 'start') {
+    if (settings.active) throw new Error('The event is already active. End it first before starting again.');
+    const voice = await getEventVoiceChannel(interaction.guild);
+    if (!voice || !settings.activityChannelId) throw new Error('Run `/lasttoleave setup` first.');
+    const members = [...voice.members.values()].filter((member) => !member.user.bot);
+    if (!members.length) throw new Error('There is nobody in the configured event VC.');
+    settings.active = true;
+    settings.paused = false;
+    settings.startedAt = Date.now();
+    settings.checkNumber = 0;
+    settings.nextCheckAt = Date.now() + 60 * 60_000;
+    settings.contestants = members.map((member) => member.id);
+    settings.eliminated = [];
+    settings.currentCheck = null;
+    if (settings.contestantRoleId) {
+      for (const member of members) await member.roles.add(settings.contestantRoleId, 'Room 7 Last to Leave contestant').catch(() => null);
+    }
+    await saveConfig();
+    const activity = await interaction.guild.channels.fetch(settings.activityChannelId).catch(() => null);
+    if (activity?.isTextBased()) {
+      await activity.send({ embeds: [new EmbedBuilder().setColor(EMBED_COLOR).setTitle('🏆 Last to Leave VC Has Started!').setDescription(`**${members.length} contestants** have entered.\n\nThe first activity check will begin <t:${Math.floor(settings.nextCheckAt / 1000)}:R>. Each check stays open for **30 minutes**.\n\n🏆 **Prize: 3,000 Robux**`).setFooter({ text: 'Room 7 • Last to Leave VC' }).setTimestamp()] });
+    }
+    await sendLastToLeaveLog(interaction.guild, 'Event Started', `${members.length} contestants entered.\nFirst activity check: <t:${Math.floor(settings.nextCheckAt / 1000)}:F>`);
+    return interaction.editReply(`✅ Event started with **${members.length} contestants**. The first activity check starts in **1 hour**.`);
+  }
+
+  if (sub === 'check-now') {
+    await startActivityCheck(interaction.guild, `manual • ${interaction.user.tag}`);
+    return interaction.editReply('✅ A 30-minute activity check has started.');
+  }
+
+  if (sub === 'pause') {
+    if (!settings.active) throw new Error('The event is not active.');
+    settings.paused = true;
+    await saveConfig();
+    return interaction.editReply('⏸️ Automatic hourly checks are paused. Any check already open will still finish normally.');
+  }
+
+  if (sub === 'resume') {
+    if (!settings.active) throw new Error('The event is not active.');
+    settings.paused = false;
+    settings.nextCheckAt = Date.now() + 60 * 60_000;
+    await saveConfig();
+    return interaction.editReply('▶️ Automatic checks resumed. The next check begins in **1 hour**.');
+  }
+
+  if (sub === 'end') {
+    if (!settings.active) throw new Error('The event is not active.');
+    if (settings.currentCheck && !settings.currentCheck.closed) await closeActivityCheck(interaction.guild, `event ended by ${interaction.user.tag}`);
+    settings.active = false;
+    settings.paused = false;
+    settings.nextCheckAt = null;
+    const remaining = [...settings.contestants];
+    await saveConfig();
+    await sendLastToLeaveLog(interaction.guild, 'Event Ended', `Remaining contestants: **${remaining.length}**\n${mentionList(remaining)}`);
+    return interaction.editReply(`🏁 Event ended. **${remaining.length} contestant(s)** remained.\n${mentionList(remaining, 20)}`);
+  }
+
+  if (sub === 'eliminate') {
+    if (!settings.active) throw new Error('The event is not active.');
+    const user = interaction.options.getUser('member', true);
+    const reason = interaction.options.getString('reason') || `Manually eliminated by ${interaction.user.tag}`;
+    if (!await eliminateContestant(interaction.guild, user.id, reason, true)) throw new Error('That member is not an active contestant.');
+    await saveConfig();
+    await sendLastToLeaveLog(interaction.guild, 'Contestant Manually Eliminated', `${user.tag} (${user.id})\nReason: ${reason}\nRemaining: ${settings.contestants.length}`);
+    return interaction.editReply(`❌ **${user.tag}** was disconnected and eliminated. **${settings.contestants.length}** remain.`);
+  }
+
+  if (sub === 'restore') {
+    if (!settings.active) throw new Error('The event is not active.');
+    const user = interaction.options.getUser('member', true);
+    if (settings.contestants.includes(user.id)) throw new Error('That member is already an active contestant.');
+    const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+    if (!member) throw new Error('That member could not be found.');
+    settings.contestants.push(user.id);
+    settings.eliminated = settings.eliminated.filter((entry) => entry.userId !== user.id);
+    if (settings.contestantRoleId) await member.roles.add(settings.contestantRoleId, 'Restored to Last to Leave event').catch(() => null);
+    await saveConfig();
+    await sendLastToLeaveLog(interaction.guild, 'Contestant Restored', `${user.tag} (${user.id}) was restored by ${interaction.user.tag}.`);
+    return interaction.editReply(`✅ **${user.tag}** has been restored. They must rejoin <#${settings.voiceChannelId}> themselves.`);
+  }
+
+  const check = settings.currentCheck && !settings.currentCheck.closed ? settings.currentCheck : null;
+  const status = new EmbedBuilder()
+    .setColor(EMBED_COLOR)
+    .setTitle('🏆 Last to Leave VC Status')
+    .addFields(
+      { name: 'Event', value: settings.active ? (settings.paused ? '⏸️ Active • checks paused' : '🟢 Active') : '🔴 Not active', inline: true },
+      { name: 'Remaining', value: String(settings.contestants.length), inline: true },
+      { name: 'Eliminated', value: String(settings.eliminated.length), inline: true },
+      { name: 'Event VC', value: settings.voiceChannelId ? `<#${settings.voiceChannelId}>` : '*Not configured*', inline: true },
+      { name: 'Activity Channel', value: settings.activityChannelId ? `<#${settings.activityChannelId}>` : '*Not configured*', inline: true },
+      { name: check ? `Current Check #${check.number}` : 'Next Check', value: check ? `Closes <t:${Math.floor(check.endsAt / 1000)}:R> • ${check.responded.length}/${check.eligible.length} responded` : (settings.active && settings.nextCheckAt ? `<t:${Math.floor(settings.nextCheckAt / 1000)}:R>` : '*None*') },
+      { name: 'Contestants', value: mentionList(settings.contestants, 30) },
+    )
+    .setFooter({ text: 'Every hour • 30 minutes to respond' })
+    .setTimestamp();
+  return interaction.editReply({ embeds: [status], allowedMentions: { parse: [] } });
 }
 
 async function handleCommunityCommand(interaction) {
@@ -1483,11 +1846,14 @@ client.once(Events.ClientReady, async () => {
     await deployCommands();
     if (qotdTimer) clearInterval(qotdTimer);
     if (communityTimer) clearInterval(communityTimer);
+    if (lastToLeaveTimer) clearInterval(lastToLeaveTimer);
     qotdTimer = setInterval(checkQotdSchedule, 30_000);
     communityTimer = setInterval(() => checkBirthdays().catch(console.error), 60_000);
+    lastToLeaveTimer = setInterval(() => processLastToLeaveSchedule().catch((error) => console.error('Last to Leave scheduler error:', error)), 15_000);
     await checkQotdSchedule();
     await checkBirthdays();
     await restoreGiveaways();
+    await processLastToLeaveSchedule();
     console.log('Room 7 systems loaded successfully.');
   } catch (error) {
     console.error('Startup setup failed:', error);
@@ -1614,6 +1980,7 @@ client.on('messageCreate', async (message) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === 'lasttoleave') return handleLastToLeaveCommand(interaction);
       if (interaction.commandName === 'config') {
         if (!await safelyDeferReply(interaction, { flags: MessageFlags.Ephemeral })) return;
         return handleConfig(interaction);
@@ -1664,10 +2031,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { name: 'Moderation', value: '`/warn` • `/warnings` • `/clearwarnings`\n`/timeout` • `/untimeout` • `/kick` • `/ban` • `/unban`\n`/purge` • `/slowmode` • `/lock` • `/unlock`' },
         { name: 'Security Setup', value: '`/config modlogs` • `/config moderation`\n`/config antispam` • `/config links` • `/config invites`\n`/config raid-protection` • `/config account-age`' },
         { name: 'Community Setup', value: '`/autorespond add` • `/autorespond remove` • `/autorespond list`\n`/config leveling` • `/config birthdays` • `/config milestones`\n`/event` • `/giveaway` • `/media pick` • `/sendportal`' },
+        { name: 'Last to Leave Event', value: '`/lasttoleave setup` • `/lasttoleave start` • `/lasttoleave status`\n`/lasttoleave check-now` • `/lasttoleave pause` • `/lasttoleave resume`\n`/lasttoleave eliminate` • `/lasttoleave restore` • `/lasttoleave end`' },
       )], files: [makeBanner()], flags: MessageFlags.Ephemeral });
       if (interaction.commandName === 'ping') return interaction.reply({ embeds: [baseEmbed().setTitle('Room 7 is Online').setDescription(`Everything is working normally.\n\n**Response time:** ${client.ws.ping}ms`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
     }
     if (interaction.isButton()) {
+      if (interaction.customId.startsWith('lasttoleave_active:')) {
+        if (!await safelyDeferReply(interaction, { flags: MessageFlags.Ephemeral })) return;
+        const settings = lastToLeaveSettings();
+        const checkNumber = Number(interaction.customId.split(':')[1]);
+        const check = settings.currentCheck;
+        if (!settings.active || !check || check.closed || check.number !== checkNumber) return interaction.editReply('This activity check is no longer active.');
+        if (Date.now() >= check.endsAt) {
+          await closeActivityCheck(interaction.guild, 'expired button click');
+          return interaction.editReply('This activity check has just closed.');
+        }
+        if (!check.eligible.includes(interaction.user.id) || !settings.contestants.includes(interaction.user.id)) return interaction.editReply('You are not an eligible contestant for this activity check.');
+        const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        if (!member || member.voice.channelId !== settings.voiceChannelId) return interaction.editReply('You must be inside the event VC when you press the button.');
+        if (check.responded.includes(interaction.user.id)) return interaction.editReply('✅ You already passed this activity check.');
+        check.responded.push(interaction.user.id);
+        await saveConfig();
+        await updateActivityCheckMessage(interaction.guild, false);
+        return interaction.editReply(`✅ You passed Activity Check #${check.number}.`);
+      }
       if (interaction.customId.startsWith('giveaway_enter:')) {
         const messageId = interaction.customId.split(':')[1];
         const data = config.giveaways[messageId];
