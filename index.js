@@ -128,6 +128,8 @@ const giveawayTimers = new Map();
 const spamTracker = new Map();
 const xpCooldowns = new Map();
 let xpSaveTimer = null;
+let configSaveQueued = false;
+let configSaveRunning = false;
 const recentJoins = [];
 const invitePattern = /(?:https?:\/\/)?(?:www\.)?(?:discord(?:app)?\.com\/invite|discord\.gg)\/[a-z0-9-]+/i;
 const urlPattern = /https?:\/\/[^\s<]+/i;
@@ -748,6 +750,27 @@ async function saveConfig() {
   await Promise.all(oldMessages.map((message) => message.delete().catch(() => null)));
 }
 
+
+function queueConfigSave(delay = 250) {
+  configSaveQueued = true;
+  if (configSaveRunning) return;
+  configSaveRunning = true;
+
+  setTimeout(async () => {
+    try {
+      while (configSaveQueued) {
+        configSaveQueued = false;
+        await saveConfig();
+      }
+    } catch (error) {
+      console.error('Queued configuration save error:', error);
+    } finally {
+      configSaveRunning = false;
+      if (configSaveQueued) queueConfigSave(delay);
+    }
+  }, delay);
+}
+
 function validateTime(value) {
   if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(value)) throw new Error('Use 24-hour time in `HH:MM` format, for example `18:00`.');
 }
@@ -972,7 +995,7 @@ function mentionList(ids, limit = 40) {
 }
 
 async function sendLastToLeaveLog(guild, title, description) {
-  const settings = lastToLeaveSettings();
+  const settings = lastToLeaveSettings().catch((error) => console.error('Last to Leave log error:', error));
   if (!settings.logChannelId) return;
   const channel = await guild.channels.fetch(settings.logChannelId).catch(() => null);
   if (!channel?.isTextBased()) return;
@@ -1066,8 +1089,8 @@ async function startActivityCheck(guild, source = 'automatic') {
     allowedMentions: { users: eligible },
   });
   check.messageId = message.id;
-  await saveConfig();
-  await sendLastToLeaveLog(guild, `Activity Check #${check.number} Started`, `Eligible contestants: **${eligible.length}**\nCloses: <t:${Math.floor(endsAt / 1000)}:F>\nStarted by: **${source}**`);
+  queueConfigSave();
+  sendLastToLeaveLog(guild, `Activity Check #${check.number} Started`, `Eligible contestants: **${eligible.length}**\nCloses: <t:${Math.floor(endsAt / 1000)}:F>\nStarted by: **${source}**`).catch((error) => console.error('Last to Leave log error:', error));
   return true;
 }
 
@@ -1120,8 +1143,8 @@ async function closeActivityCheck(guild, reason = 'timer') {
       allowedMentions: { users: eliminated },
     }).catch(() => null);
   }
-  await sendLastToLeaveLog(guild, `Activity Check #${check.number} Completed`, `Passed: **${responded.length}**\nDisqualified: **${eliminated.length}**\nRemaining: **${settings.contestants.length}**\nClosed by: **${reason}**`);
-  await saveConfig();
+  sendLastToLeaveLog(guild, `Activity Check #${check.number} Completed`, `Passed: **${responded.length}**\nDisqualified: **${eliminated.length}**\nRemaining: **${settings.contestants.length}**\nClosed by: **${reason}**`).catch((error) => console.error('Last to Leave log error:', error));
+  queueConfigSave();
 }
 
 async function processLastToLeaveSchedule() {
@@ -1141,7 +1164,14 @@ async function processLastToLeaveSchedule() {
 }
 
 async function handleLastToLeaveCommand(interaction) {
-  if (!await safelyDeferReply(interaction, { flags: MessageFlags.Ephemeral })) return;
+  if (!interaction.deferred && !interaction.replied) {
+    try {
+      await interaction.reply({ content: '⏳ Running Last to Leave command...', flags: MessageFlags.Ephemeral });
+    } catch (error) {
+      if (isUnknownInteraction(error)) return;
+      throw error;
+    }
+  }
   const settings = lastToLeaveSettings();
   const sub = interaction.options.getSubcommand();
 
@@ -1157,7 +1187,7 @@ async function handleLastToLeaveCommand(interaction) {
     settings.logChannelId = log?.id || null;
     settings.checkIntervalMinutes = 60;
     settings.responseWindowMinutes = 30;
-    await saveConfig();
+    queueConfigSave();
     return interaction.editReply(`✅ Last to Leave configured.\n\n**Event VC:** ${voice}\n**Activity checks:** ${activity}\n**Contestant role:** ${role || 'None'}\n**Checks:** Every hour, open for 30 minutes.`);
   }
 
@@ -1178,12 +1208,12 @@ async function handleLastToLeaveCommand(interaction) {
     if (settings.contestantRoleId) {
       for (const member of members) await member.roles.add(settings.contestantRoleId, 'Room 7 Last to Leave contestant').catch(() => null);
     }
-    await saveConfig();
+    queueConfigSave();
     const activity = await interaction.guild.channels.fetch(settings.activityChannelId).catch(() => null);
     if (activity?.isTextBased()) {
       await activity.send({ embeds: [new EmbedBuilder().setColor(EMBED_COLOR).setTitle('🏆 Last to Leave VC Has Started!').setDescription(`**${members.length} contestants** have entered.\n\nThe first activity check will begin <t:${Math.floor(settings.nextCheckAt / 1000)}:R>. Each check stays open for **30 minutes**.\n\n🏆 **Prize: 3,000 Robux**`).setFooter({ text: 'Room 7 • Last to Leave VC' }).setTimestamp()] });
     }
-    await sendLastToLeaveLog(interaction.guild, 'Event Started', `${members.length} contestants entered.\nFirst activity check: <t:${Math.floor(settings.nextCheckAt / 1000)}:F>`);
+    sendLastToLeaveLog(interaction.guild, 'Event Started', `${members.length} contestants entered.\nFirst activity check: <t:${Math.floor(settings.nextCheckAt / 1000)}:F>`).catch((error) => console.error('Last to Leave log error:', error));
     return interaction.editReply(`✅ Event started with **${members.length} contestants**. The first activity check starts in **1 hour**.`);
   }
 
@@ -1195,7 +1225,7 @@ async function handleLastToLeaveCommand(interaction) {
   if (sub === 'pause') {
     if (!settings.active) throw new Error('The event is not active.');
     settings.paused = true;
-    await saveConfig();
+    queueConfigSave();
     return interaction.editReply('⏸️ Automatic hourly checks are paused. Any check already open will still finish normally.');
   }
 
@@ -1203,7 +1233,7 @@ async function handleLastToLeaveCommand(interaction) {
     if (!settings.active) throw new Error('The event is not active.');
     settings.paused = false;
     settings.nextCheckAt = Date.now() + 60 * 60_000;
-    await saveConfig();
+    queueConfigSave();
     return interaction.editReply('▶️ Automatic checks resumed. The next check begins in **1 hour**.');
   }
 
@@ -1214,8 +1244,8 @@ async function handleLastToLeaveCommand(interaction) {
     settings.paused = false;
     settings.nextCheckAt = null;
     const remaining = [...settings.contestants];
-    await saveConfig();
-    await sendLastToLeaveLog(interaction.guild, 'Event Ended', `Remaining contestants: **${remaining.length}**\n${mentionList(remaining)}`);
+    queueConfigSave();
+    sendLastToLeaveLog(interaction.guild, 'Event Ended', `Remaining contestants: **${remaining.length}**\n${mentionList(remaining)}`).catch((error) => console.error('Last to Leave log error:', error));
     return interaction.editReply(`🏁 Event ended. **${remaining.length} contestant(s)** remained.\n${mentionList(remaining, 20)}`);
   }
 
@@ -1224,8 +1254,8 @@ async function handleLastToLeaveCommand(interaction) {
     const user = interaction.options.getUser('member', true);
     const reason = interaction.options.getString('reason') || `Manually eliminated by ${interaction.user.tag}`;
     if (!await eliminateContestant(interaction.guild, user.id, reason, true)) throw new Error('That member is not an active contestant.');
-    await saveConfig();
-    await sendLastToLeaveLog(interaction.guild, 'Contestant Manually Eliminated', `${user.tag} (${user.id})\nReason: ${reason}\nRemaining: ${settings.contestants.length}`);
+    queueConfigSave();
+    sendLastToLeaveLog(interaction.guild, 'Contestant Manually Eliminated', `${user.tag} (${user.id})\nReason: ${reason}\nRemaining: ${settings.contestants.length}`).catch((error) => console.error('Last to Leave log error:', error));
     return interaction.editReply(`❌ **${user.tag}** was disconnected and eliminated. **${settings.contestants.length}** remain.`);
   }
 
@@ -1238,8 +1268,8 @@ async function handleLastToLeaveCommand(interaction) {
     settings.contestants.push(user.id);
     settings.eliminated = settings.eliminated.filter((entry) => entry.userId !== user.id);
     if (settings.contestantRoleId) await member.roles.add(settings.contestantRoleId, 'Restored to Last to Leave event').catch(() => null);
-    await saveConfig();
-    await sendLastToLeaveLog(interaction.guild, 'Contestant Restored', `${user.tag} (${user.id}) was restored by ${interaction.user.tag}.`);
+    queueConfigSave();
+    sendLastToLeaveLog(interaction.guild, 'Contestant Restored', `${user.tag} (${user.id}) was restored by ${interaction.user.tag}.`).catch((error) => console.error('Last to Leave log error:', error));
     return interaction.editReply(`✅ **${user.tag}** has been restored. They must rejoin <#${settings.voiceChannelId}> themselves.`);
   }
 
@@ -2051,9 +2081,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!member || member.voice.channelId !== settings.voiceChannelId) return interaction.editReply('You must be inside the event VC when you press the button.');
         if (check.responded.includes(interaction.user.id)) return interaction.editReply('✅ You already passed this activity check.');
         check.responded.push(interaction.user.id);
-        await saveConfig();
-        await updateActivityCheckMessage(interaction.guild, false);
-        return interaction.editReply(`✅ You passed Activity Check #${check.number}.`);
+        queueConfigSave();
+        await interaction.editReply(`✅ You passed Activity Check #${check.number}.`);
+        updateActivityCheckMessage(interaction.guild, false).catch((error) => console.error('Activity-check message update error:', error));
+        return;
       }
       if (interaction.customId.startsWith('giveaway_enter:')) {
         const messageId = interaction.customId.split(':')[1];
@@ -2100,8 +2131,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     console.error('Interaction error:', error);
     const message = `❌ ${error.message || 'Something went wrong.'}`;
-    if (interaction.deferred) await interaction.editReply({ content: message, embeds: [], components: [], files: [] }).catch(() => null);
-    else if (interaction.replied) await interaction.followUp({ content: message, flags: MessageFlags.Ephemeral }).catch(() => null);
+    if (interaction.deferred || interaction.replied) await interaction.editReply({ content: message, embeds: [], components: [], files: [] }).catch(() => null);
     else await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => null);
   }
 });
