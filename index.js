@@ -979,10 +979,23 @@ function withTimeout(promise, milliseconds = 10000, label = 'Discord request') {
 }
 
 function lastToLeaveSettings() {
-  config.lastToLeave = { ...structuredClone(defaultConfig.lastToLeave), ...(config.lastToLeave || {}) };
-  config.lastToLeave.contestants = Array.isArray(config.lastToLeave.contestants) ? config.lastToLeave.contestants : [];
-  config.lastToLeave.eliminated = Array.isArray(config.lastToLeave.eliminated) ? config.lastToLeave.eliminated : [];
-  return config.lastToLeave;
+  // Keep the same object reference. Replacing this object while a command is
+  // running makes that command continue editing an old, detached copy.
+  if (!config.lastToLeave || typeof config.lastToLeave !== 'object' || Array.isArray(config.lastToLeave)) {
+    config.lastToLeave = structuredClone(defaultConfig.lastToLeave);
+  }
+
+  const settings = config.lastToLeave;
+  for (const [key, value] of Object.entries(defaultConfig.lastToLeave)) {
+    if (settings[key] === undefined) settings[key] = structuredClone(value);
+  }
+
+  settings.contestants = Array.isArray(settings.contestants) ? settings.contestants : [];
+  settings.eliminated = Array.isArray(settings.eliminated) ? settings.eliminated : [];
+  if (settings.currentCheck !== null && (typeof settings.currentCheck !== 'object' || Array.isArray(settings.currentCheck))) {
+    settings.currentCheck = null;
+  }
+  return settings;
 }
 
 function activityCheckButton(checkNumber, disabled = false) {
@@ -1229,6 +1242,7 @@ async function handleLastToLeaveCommand(interaction) {
     settings.contestants = members.map((member) => member.id);
     settings.eliminated = [];
     settings.currentCheck = null;
+    console.log(`[LastToLeave] Event state activated in memory with ${settings.contestants.length} contestant(s).`);
     if (settings.contestantRoleId) {
       for (const member of members) await member.roles.add(settings.contestantRoleId, 'Room 7 Last to Leave contestant').catch(() => null);
     }
