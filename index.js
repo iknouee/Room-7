@@ -970,6 +970,14 @@ async function restoreGiveaways() {
 }
 
 
+function withTimeout(promise, milliseconds = 10000, label = 'Discord request') {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.ceil(milliseconds / 1000)} seconds.`)), milliseconds);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 function lastToLeaveSettings() {
   config.lastToLeave = { ...structuredClone(defaultConfig.lastToLeave), ...(config.lastToLeave || {}) };
   config.lastToLeave.contestants = Array.isArray(config.lastToLeave.contestants) ? config.lastToLeave.contestants : [];
@@ -995,20 +1003,22 @@ function mentionList(ids, limit = 40) {
 }
 
 async function sendLastToLeaveLog(guild, title, description) {
-  const settings = lastToLeaveSettings().catch((error) => console.error('Last to Leave log error:', error));
+  const settings = lastToLeaveSettings();
   if (!settings.logChannelId) return;
-  const channel = await guild.channels.fetch(settings.logChannelId).catch(() => null);
+  const channel = guild.channels.cache.get(settings.logChannelId)
+    || await withTimeout(guild.channels.fetch(settings.logChannelId), 8000, 'Fetching the event log channel').catch(() => null);
   if (!channel?.isTextBased()) return;
-  await channel.send({
+  await withTimeout(channel.send({
     embeds: [new EmbedBuilder().setColor(EMBED_COLOR).setTitle(title).setDescription(description).setTimestamp().setFooter({ text: 'Room 7 • Last to Leave VC' })],
     allowedMentions: { parse: [] },
-  }).catch(() => null);
+  }), 8000, 'Sending the event log').catch((error) => console.error('Last to Leave log send error:', error));
 }
 
 async function getEventVoiceChannel(guild) {
   const settings = lastToLeaveSettings();
   if (!settings.voiceChannelId) return null;
-  const channel = await guild.channels.fetch(settings.voiceChannelId).catch(() => null);
+  const channel = guild.channels.cache.get(settings.voiceChannelId)
+    || await withTimeout(guild.channels.fetch(settings.voiceChannelId), 8000, 'Fetching the event VC').catch(() => null);
   return channel?.type === ChannelType.GuildVoice ? channel : null;
 }
 
@@ -1047,8 +1057,9 @@ async function startActivityCheck(guild, source = 'automatic') {
 
   const voiceChannel = await getEventVoiceChannel(guild);
   if (!voiceChannel) throw new Error('The configured event voice channel could not be found. Run `/lasttoleave setup` again.');
-  const activityChannel = await guild.channels.fetch(settings.activityChannelId).catch(() => null);
-  if (!activityChannel?.isTextBased()) throw new Error('The configured activity-check channel could not be found.');
+  const activityChannel = guild.channels.cache.get(settings.activityChannelId)
+    || await withTimeout(guild.channels.fetch(settings.activityChannelId), 8000, 'Fetching the activity-check channel').catch(() => null);
+  if (!activityChannel?.isTextBased()) throw new Error('The configured activity-check channel could not be found, or the bot cannot access it.');
 
   const contestantSet = new Set(settings.contestants);
   const eligible = [...voiceChannel.members.values()]
@@ -1072,7 +1083,10 @@ async function startActivityCheck(guild, source = 'automatic') {
   settings.currentCheck = check;
   settings.nextCheckAt = startedAt + settings.checkIntervalMinutes * 60_000;
 
-  const message = await activityChannel.send({
+  console.log(`[LastToLeave] Starting activity check #${check.number} with ${eligible.length} eligible contestant(s).`);
+  let message;
+  try {
+    message = await withTimeout(activityChannel.send({
     content: eligible.length ? eligible.map((id) => `<@${id}>`).join(' ') : '',
     embeds: [new EmbedBuilder()
       .setColor(EMBED_COLOR)
@@ -1087,8 +1101,14 @@ async function startActivityCheck(guild, source = 'automatic') {
       .setTimestamp()],
     components: [activityCheckButton(check.number)],
     allowedMentions: { users: eligible },
-  });
+    }), 12000, 'Posting the activity check');
+  } catch (error) {
+    settings.currentCheck = null;
+    settings.checkNumber = Math.max(0, settings.checkNumber - 1);
+    throw error;
+  }
   check.messageId = message.id;
+  console.log(`[LastToLeave] Activity check #${check.number} posted as message ${message.id}.`);
   queueConfigSave();
   sendLastToLeaveLog(guild, `Activity Check #${check.number} Started`, `Eligible contestants: **${eligible.length}**\nCloses: <t:${Math.floor(endsAt / 1000)}:F>\nStarted by: **${source}**`).catch((error) => console.error('Last to Leave log error:', error));
   return true;
@@ -1097,12 +1117,15 @@ async function startActivityCheck(guild, source = 'automatic') {
 async function eliminateContestant(guild, userId, reason = 'Did not complete the activity check', disconnect = true) {
   const settings = lastToLeaveSettings();
   if (!settings.contestants.includes(userId)) return false;
-  const member = await guild.members.fetch(userId).catch(() => null);
-  if (disconnect && member?.voice?.channelId === settings.voiceChannelId && member.voice.disconnectable) {
-    await member.voice.disconnect(reason).catch(() => null);
+  const member = guild.members.cache.get(userId)
+    || await withTimeout(guild.members.fetch(userId), 8000, 'Fetching the contestant').catch(() => null);
+  if (disconnect && member?.voice?.channelId === settings.voiceChannelId) {
+    if (!member.voice.disconnectable) throw new Error(`I cannot disconnect ${member.user.tag}. Give the bot Move Members and place its role high enough.`);
+    await withTimeout(member.voice.disconnect(reason), 10000, `Disconnecting ${member.user.tag}`);
   }
   if (settings.contestantRoleId && member?.roles.cache.has(settings.contestantRoleId)) {
-    await member.roles.remove(settings.contestantRoleId, reason).catch(() => null);
+    await withTimeout(member.roles.remove(settings.contestantRoleId, reason), 10000, `Removing the contestant role from ${member.user.tag}`)
+      .catch((error) => console.error('Contestant role removal error:', error));
   }
   settings.contestants = settings.contestants.filter((id) => id !== userId);
   if (!settings.eliminated.some((entry) => entry.userId === userId)) {
@@ -1174,6 +1197,7 @@ async function handleLastToLeaveCommand(interaction) {
   }
   const settings = lastToLeaveSettings();
   const sub = interaction.options.getSubcommand();
+  console.log(`[LastToLeave] /lasttoleave ${sub} used by ${interaction.user.tag} (${interaction.user.id}).`);
 
   if (sub === 'setup') {
     const voice = interaction.options.getChannel('voice-channel', true);
@@ -1218,6 +1242,7 @@ async function handleLastToLeaveCommand(interaction) {
   }
 
   if (sub === 'check-now') {
+    await interaction.editReply('⏳ Posting the activity check now...');
     await startActivityCheck(interaction.guild, `manual • ${interaction.user.tag}`);
     return interaction.editReply('✅ A 30-minute activity check has started.');
   }
@@ -1253,6 +1278,7 @@ async function handleLastToLeaveCommand(interaction) {
     if (!settings.active) throw new Error('The event is not active.');
     const user = interaction.options.getUser('member', true);
     const reason = interaction.options.getString('reason') || `Manually eliminated by ${interaction.user.tag}`;
+    await interaction.editReply(`⏳ Eliminating **${user.tag}**...`);
     if (!await eliminateContestant(interaction.guild, user.id, reason, true)) throw new Error('That member is not an active contestant.');
     queueConfigSave();
     sendLastToLeaveLog(interaction.guild, 'Contestant Manually Eliminated', `${user.tag} (${user.id})\nReason: ${reason}\nRemaining: ${settings.contestants.length}`).catch((error) => console.error('Last to Leave log error:', error));
