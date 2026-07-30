@@ -10,6 +10,7 @@ const {
   ChannelType,
   Client,
   EmbedBuilder,
+  Events,
   GatewayIntentBits,
   MessageFlags,
   OverwriteType,
@@ -427,11 +428,64 @@ function panelButtons() {
   );
 }
 
+function normaliseComponentEmoji(value) {
+  if (!value || typeof value !== 'string') return null;
+  const emoji = value.trim();
+  if (!emoji) return null;
+
+  // Discord custom emoji: <:name:id> or <a:name:id>
+  const custom = emoji.match(/^<(?:(a)?):([A-Za-z0-9_]{2,32}):(\d{17,20})>$/);
+  if (custom) return { animated: Boolean(custom[1]), name: custom[2], id: custom[3] };
+
+  // Reject colon aliases such as :pink_heart: and other plain text values.
+  if (/^:[^:]+:$/.test(emoji) || /[A-Za-z0-9]/.test(emoji)) return null;
+
+  // Unicode emoji. Discord accepts the raw unicode string as the name.
+  return { name: emoji };
+}
+
+function setOptionEmojiSafely(option, value) {
+  const emoji = normaliseComponentEmoji(value);
+  if (!emoji) return option;
+  try {
+    option.setEmoji(emoji);
+  } catch (_) {
+    // Invalid or inaccessible emojis are simply omitted from the menu.
+  }
+  return option;
+}
+
+function isUnknownInteraction(error) {
+  return error?.code === 10062 || error?.rawError?.code === 10062;
+}
+
+async function safelyDeferReply(interaction, options = {}) {
+  if (interaction.deferred || interaction.replied) return true;
+  try {
+    await interaction.deferReply(options);
+    return true;
+  } catch (error) {
+    if (isUnknownInteraction(error)) return false;
+    throw error;
+  }
+}
+
+async function safelyDeferUpdate(interaction) {
+  if (interaction.deferred || interaction.replied) return true;
+  try {
+    await interaction.deferUpdate();
+    return true;
+  } catch (error) {
+    if (isUnknownInteraction(error)) return false;
+    throw error;
+  }
+}
+
 function colourMenu(member) {
   const options = config.colours.map((item) => {
     const role = member.guild.roles.cache.get(item.id);
     const option = new StringSelectMenuOptionBuilder().setLabel(item.name).setDescription(role ? `Role color: ${role.hexColor}` : 'Color role').setValue(item.id).setDefault(member.roles.cache.has(item.id));
-    if (item.emoji) option.setEmoji(item.emoji);
+    setOptionEmojiSafely(option, item.emoji);
     return option;
   });
   options.push(new StringSelectMenuOptionBuilder().setLabel('Remove Color').setDescription('Remove your current color role').setEmoji('🗑️').setValue('remove_colour'));
@@ -441,7 +495,7 @@ function colourMenu(member) {
 function pingMenu(member) {
   return new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId('room7_ping_roles').setPlaceholder('Choose your ping roles...').setMinValues(0).setMaxValues(config.pings.length).addOptions(config.pings.map((item) => {
     const option = new StringSelectMenuOptionBuilder().setLabel(item.name).setDescription(item.description || 'Receive this notification').setValue(item.id).setDefault(member.roles.cache.has(item.id));
-    if (item.emoji) option.setEmoji(item.emoji);
+    setOptionEmojiSafely(option, item.emoji);
     return option;
   })));
 }
@@ -954,7 +1008,7 @@ async function handleCommunityCommand(interaction) {
     const winners = interaction.options.getInteger('winners') || 1;
     const role = interaction.options.getRole('ping-role');
     const endAt = Date.now() + minutes * 60_000;
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    if (!await safelyDeferReply(interaction, { flags: MessageFlags.Ephemeral })) return;
     const message = await interaction.channel.send({
       content: role ? `${role}` : '',
       embeds: [baseEmbed().setTitle('🎉 Room 7 Giveaway').setDescription(`**Prize:** ${prize}\n\nClick the button below to enter.\n**Ends:** <t:${Math.floor(endAt / 1000)}:R>\n**Winners:** ${winners}\n**Hosted by:** ${interaction.user}`)],
@@ -1393,7 +1447,7 @@ async function openPrivateRoleSelector(interaction, type) {
   const items = isColour ? config.colours : config.pings;
 
   // Acknowledge the button immediately so Discord does not expire the interaction.
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!await safelyDeferReply(interaction, { flags: MessageFlags.Ephemeral })) return;
 
   if (!items.length) {
     return interaction.editReply({ content: `No ${isColour ? 'color' : 'ping'} roles have been configured yet.` });
@@ -1418,7 +1472,7 @@ async function deployCommands() {
   console.log(`Registered ${commands.length} guild command(s).`);
 }
 
-client.once('ready', async () => {
+client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
   client.user.setPresence({ activities: [{ name: BOT_STATUS }], status: 'online' });
   try {
@@ -1557,11 +1611,11 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-client.on('interactionCreate', async (interaction) => {
+client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'config') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        if (!await safelyDeferReply(interaction, { flags: MessageFlags.Ephemeral })) return;
         return handleConfig(interaction);
       }
       if (['autorespond', 'rank', 'leaderboard', 'rep', 'reputation', 'birthday', 'event', 'giveaway', 'serverstats', 'media'].includes(interaction.commandName)) {
@@ -1569,7 +1623,7 @@ client.on('interactionCreate', async (interaction) => {
       }
       if (interaction.commandName === 'setup') {
         const sub = interaction.options.getSubcommand();
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        if (!await safelyDeferReply(interaction, { flags: MessageFlags.Ephemeral })) return;
         if (sub === 'roles') {
           if (!config.colours.length && !config.pings.length) return interaction.editReply('Add roles first with `/config add-color` and `/config add-ping`.');
           const message = await interaction.channel.send({ embeds: [rolePanelEmbed()], components: [panelButtons()], files: [makeBanner()] });
@@ -1587,7 +1641,7 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
       if (interaction.commandName === 'qotd') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        if (!await safelyDeferReply(interaction, { flags: MessageFlags.Ephemeral })) return;
         await postQotd(interaction.guild, interaction.channelId);
         return interaction.editReply('✅ A Question of the Day has been posted here.');
       }
@@ -1595,7 +1649,7 @@ client.on('interactionCreate', async (interaction) => {
         return handleModerationCommand(interaction);
       }
       if (interaction.commandName === 'sendportal') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        if (!await safelyDeferReply(interaction, { flags: MessageFlags.Ephemeral })) return;
         await interaction.channel.send({
           content: '@here',
           embeds: [portalEmbed()],
@@ -1633,7 +1687,7 @@ client.on('interactionCreate', async (interaction) => {
     }
     if (interaction.isStringSelectMenu()) {
       if (interaction.customId === 'room7_colour_roles') {
-        await interaction.deferUpdate();
+        if (!await safelyDeferUpdate(interaction)) return;
         const selected = interaction.values[0];
         const allIds = config.colours.map((item) => item.id);
         const removeIds = allIds.filter((id) => interaction.member.roles.cache.has(id));
@@ -1643,7 +1697,7 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.editReply({ embeds: [baseEmbed().setTitle(item ? 'Color Updated' : 'Color Removed').setDescription(item ? `${item.emoji || '🎨'} Your color is now **${item.name}**.` : '🗑️ Your color role has been removed.')], components: [colourMenu(interaction.member)], files: [makeBanner()] });
       }
       if (interaction.customId === 'room7_ping_roles') {
-        await interaction.deferUpdate();
+        if (!await safelyDeferUpdate(interaction)) return;
         const allIds = config.pings.map((item) => item.id);
         const selectedIds = interaction.values;
         const currentIds = allIds.filter((id) => interaction.member.roles.cache.has(id));
@@ -1653,6 +1707,10 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
   } catch (error) {
+    if (isUnknownInteraction(error)) {
+      console.warn(`Ignored expired interaction ${interaction.id}.`);
+      return;
+    }
     console.error('Interaction error:', error);
     const message = `❌ ${error.message || 'Something went wrong.'}`;
     if (interaction.deferred) await interaction.editReply({ content: message, embeds: [], components: [], files: [] }).catch(() => null);
