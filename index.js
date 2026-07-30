@@ -1145,7 +1145,7 @@ async function handleConfig(interaction) {
     const channel = interaction.options.getChannel('channel', true);
     config.welcome.channelId = channel.id;
     await saveConfig();
-    return interaction.reply({ embeds: [baseEmbed().setTitle('Welcome Messages Configured').setDescription(`New member welcomes will now be sent in ${channel}.`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ embeds: [baseEmbed().setTitle('Welcome Messages Configured').setDescription(`New member welcomes will now be sent in ${channel}.`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'qotd') {
     const channel = interaction.options.getChannel('channel', true);
@@ -1154,35 +1154,35 @@ async function handleConfig(interaction) {
     validateTime(time);
     config.qotd = { ...config.qotd, channelId: channel.id, roleId: role.id, time };
     await saveConfig();
-    return interaction.reply({ embeds: [baseEmbed().setTitle('Question of the Day Configured').setDescription(`A random question will post in ${channel} every day at **${time} UK time**, pinging ${role}.`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ embeds: [baseEmbed().setTitle('Question of the Day Configured').setDescription(`A random question will post in ${channel} every day at **${time} UK time**, pinging ${role}.`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'birthdays') {
     const channel = interaction.options.getChannel('channel', true);
     config.birthdays.channelId = channel.id;
     await saveConfig();
-    return interaction.reply({ content: `✅ Birthday announcements will be posted in ${channel}.`, flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: `✅ Birthday announcements will be posted in ${channel}.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'milestones') {
     const channel = interaction.options.getChannel('channel', true);
     config.milestones.channelId = channel.id;
     await saveConfig();
-    return interaction.reply({ content: `✅ Member milestones will be posted in ${channel}.`, flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: `✅ Member milestones will be posted in ${channel}.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'leveling') {
     config.leveling.enabled = interaction.options.getBoolean('enabled', true);
     await saveConfig();
-    return interaction.reply({ content: `✅ Leveling is now **${config.leveling.enabled ? 'enabled' : 'disabled'}**.`, flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: `✅ Leveling is now **${config.leveling.enabled ? 'enabled' : 'disabled'}**.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'moderation') {
     config.moderation.enabled = interaction.options.getBoolean('enabled', true);
     await saveConfig();
-    return interaction.reply({ content: `✅ Automatic moderation is now **${config.moderation.enabled ? 'enabled' : 'disabled'}**.`, flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: `✅ Automatic moderation is now **${config.moderation.enabled ? 'enabled' : 'disabled'}**.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'modlogs') {
     const channel = interaction.options.getChannel('channel', true);
     config.moderation.logChannelId = channel.id;
     await saveConfig();
-    return interaction.reply({ content: `✅ Moderation actions will be logged in ${channel}.`, flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: `✅ Moderation actions will be logged in ${channel}.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'antispam') {
     const settings = config.moderation.antispam;
@@ -1191,13 +1191,13 @@ async function handleConfig(interaction) {
     settings.seconds = interaction.options.getInteger('seconds') || settings.seconds;
     settings.timeoutMinutes = interaction.options.getInteger('timeout') || settings.timeoutMinutes;
     await saveConfig();
-    return interaction.reply({ content: `✅ Anti-spam is **${settings.enabled ? 'enabled' : 'disabled'}** — ${settings.messages} messages in ${settings.seconds}s triggers a ${settings.timeoutMinutes}-minute timeout.`, flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: `✅ Anti-spam is **${settings.enabled ? 'enabled' : 'disabled'}** — ${settings.messages} messages in ${settings.seconds}s triggers a ${settings.timeoutMinutes}-minute timeout.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'links' || subcommand === 'invites') {
     const enabled = interaction.options.getBoolean('enabled', true);
     config.moderation[subcommand].enabled = enabled;
     await saveConfig();
-    return interaction.reply({ content: `✅ ${subcommand === 'links' ? 'Regular link' : 'Discord invite'} blocking is now **${enabled ? 'enabled' : 'disabled'}**.`, flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: `✅ ${subcommand === 'links' ? 'Regular link' : 'Discord invite'} blocking is now **${enabled ? 'enabled' : 'disabled'}**.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'raid-protection') {
     const settings = config.moderation.raid;
@@ -1206,7 +1206,7 @@ async function handleConfig(interaction) {
     settings.seconds = interaction.options.getInteger('seconds') || settings.seconds;
     settings.lockdownMinutes = interaction.options.getInteger('lockdown') || settings.lockdownMinutes;
     await saveConfig();
-    return interaction.reply({ content: `✅ Raid protection is **${settings.enabled ? 'enabled' : 'disabled'}** — ${settings.joins} joins in ${settings.seconds}s triggers a ${settings.lockdownMinutes}-minute lockdown.`, flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: `✅ Raid protection is **${settings.enabled ? 'enabled' : 'disabled'}** — ${settings.joins} joins in ${settings.seconds}s triggers a ${settings.lockdownMinutes}-minute lockdown.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'account-age') {
     const settings = config.moderation.accountAge;
@@ -1214,7 +1214,7 @@ async function handleConfig(interaction) {
     settings.minimumDays = interaction.options.getInteger('days') ?? settings.minimumDays;
     settings.action = interaction.options.getString('action') || settings.action;
     await saveConfig();
-    return interaction.reply({ content: `✅ New-account protection is **${settings.enabled ? 'enabled' : 'disabled'}** — accounts under ${settings.minimumDays} day(s) will receive action: **${settings.action}**.`, flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: `✅ New-account protection is **${settings.enabled ? 'enabled' : 'disabled'}** — accounts under ${settings.minimumDays} day(s) will receive action: **${settings.action}**.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'add-color' || subcommand === 'add-ping') {
     const role = interaction.options.getRole('role', true);
@@ -1233,7 +1233,7 @@ async function handleConfig(interaction) {
     target.push(item);
     await saveConfig();
     await refreshPanel(interaction.guild);
-    return interaction.reply({ embeds: [baseEmbed().setTitle(isColour ? 'Color Role Added' : 'Ping Role Added').setDescription(`${emoji} ${role} now appears as **${name}** in the role menu.`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ embeds: [baseEmbed().setTitle(isColour ? 'Color Role Added' : 'Ping Role Added').setDescription(`${emoji} ${role} now appears as **${name}** in the role menu.`)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'remove-color' || subcommand === 'remove-ping') {
     const role = interaction.options.getRole('role', true);
@@ -1244,7 +1244,7 @@ async function handleConfig(interaction) {
     if (config[key].length === before) throw new Error(`**${role.name}** is not configured in that menu.`);
     await saveConfig();
     await refreshPanel(interaction.guild);
-    return interaction.reply({ content: `✅ Removed **${role.name}** from the ${isColour ? 'color' : 'ping'} menu.`, flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: `✅ Removed **${role.name}** from the ${isColour ? 'color' : 'ping'} menu.`, flags: MessageFlags.Ephemeral });
   }
   if (subcommand === 'clear') {
     const section = interaction.options.getString('section', true);
@@ -1252,11 +1252,11 @@ async function handleConfig(interaction) {
     if (section === 'everything' || section === 'pings') config.pings = [];
     await saveConfig();
     await refreshPanel(interaction.guild);
-    return interaction.reply({ content: '✅ The selected configuration has been cleared.', flags: MessageFlags.Ephemeral });
+    return interaction.editReply({ content: '✅ The selected configuration has been cleared.', flags: MessageFlags.Ephemeral });
   }
   const colourList = config.colours.length ? config.colours.map((item) => `${item.emoji || '🎨'} <@&${item.id}>`).join('\n') : '*Not configured.*';
   const pingList = config.pings.length ? config.pings.map((item) => `${item.emoji || '🔔'} <@&${item.id}>`).join('\n') : '*Not configured.*';
-  return interaction.reply({
+  return interaction.editReply({
     embeds: [baseEmbed().setTitle('Room 7 Configuration').addFields(
       { name: `🎨 Color Roles (${config.colours.length})`, value: colourList, inline: true },
       { name: `🔔 Ping Roles (${config.pings.length})`, value: pingList, inline: true },
@@ -1274,8 +1274,25 @@ async function handleConfig(interaction) {
 async function openPrivateRoleSelector(interaction, type) {
   const isColour = type === 'colour';
   const items = isColour ? config.colours : config.pings;
-  if (!items.length) return interaction.reply({ content: `No ${isColour ? 'color' : 'ping'} roles have been configured yet.`, flags: MessageFlags.Ephemeral });
-  return interaction.reply({ embeds: [baseEmbed().setTitle(isColour ? 'Choose Your Color' : 'Choose Your Notifications').setDescription(isColour ? 'Select one color below. Choosing another automatically replaces your current one.' : 'Select every notification you want. Clear your selections to remove all ping roles.')], components: [isColour ? colourMenu(interaction.member) : pingMenu(interaction.member)], files: [makeBanner()], flags: MessageFlags.Ephemeral });
+
+  // Acknowledge the button immediately so Discord does not expire the interaction.
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  if (!items.length) {
+    return interaction.editReply({ content: `No ${isColour ? 'color' : 'ping'} roles have been configured yet.` });
+  }
+
+  // Refresh the member so the selected/default roles are always accurate.
+  const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => interaction.member);
+  return interaction.editReply({
+    embeds: [baseEmbed()
+      .setTitle(isColour ? 'Choose Your Color' : 'Choose Your Notifications')
+      .setDescription(isColour
+        ? 'Select one color below. Choosing another automatically replaces your current one.'
+        : 'Select every notification you want. Clear your selections to remove all ping roles.')],
+    components: [isColour ? colourMenu(member) : pingMenu(member)],
+    files: [makeBanner()],
+  });
 }
 
 async function deployCommands() {
@@ -1426,7 +1443,10 @@ client.on('messageCreate', async (message) => {
 client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === 'config') return handleConfig(interaction);
+      if (interaction.commandName === 'config') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        return handleConfig(interaction);
+      }
       if (['autorespond', 'rank', 'leaderboard', 'rep', 'reputation', 'birthday', 'event', 'giveaway', 'serverstats', 'media'].includes(interaction.commandName)) {
         return handleCommunityCommand(interaction);
       }
@@ -1496,27 +1516,30 @@ client.on('interactionCreate', async (interaction) => {
     }
     if (interaction.isStringSelectMenu()) {
       if (interaction.customId === 'room7_colour_roles') {
+        await interaction.deferUpdate();
         const selected = interaction.values[0];
         const allIds = config.colours.map((item) => item.id);
         const removeIds = allIds.filter((id) => interaction.member.roles.cache.has(id));
         const addIds = selected === 'remove_colour' ? [] : [selected];
         await safeRoleUpdate(interaction.member, removeIds, addIds);
         const item = config.colours.find((entry) => entry.id === selected);
-        return interaction.update({ embeds: [baseEmbed().setTitle(item ? 'Color Updated' : 'Color Removed').setDescription(item ? `${item.emoji || '🎨'} Your color is now **${item.name}**.` : '🗑️ Your color role has been removed.')], components: [colourMenu(interaction.member)], files: [makeBanner()] });
+        return interaction.editReply({ embeds: [baseEmbed().setTitle(item ? 'Color Updated' : 'Color Removed').setDescription(item ? `${item.emoji || '🎨'} Your color is now **${item.name}**.` : '🗑️ Your color role has been removed.')], components: [colourMenu(interaction.member)], files: [makeBanner()] });
       }
       if (interaction.customId === 'room7_ping_roles') {
+        await interaction.deferUpdate();
         const allIds = config.pings.map((item) => item.id);
         const selectedIds = interaction.values;
         const currentIds = allIds.filter((id) => interaction.member.roles.cache.has(id));
         await safeRoleUpdate(interaction.member, currentIds.filter((id) => !selectedIds.includes(id)), selectedIds.filter((id) => !interaction.member.roles.cache.has(id)));
         const names = config.pings.filter((item) => selectedIds.includes(item.id)).map((item) => `${item.emoji || '🔔'} ${item.name}`);
-        return interaction.update({ embeds: [baseEmbed().setTitle('Ping Roles Updated').setDescription(names.length ? `You will now receive:\n${names.map((name) => `• **${name}**`).join('\n')}` : '🔕 All of your ping roles have been removed.')], components: [pingMenu(interaction.member)], files: [makeBanner()] });
+        return interaction.editReply({ embeds: [baseEmbed().setTitle('Ping Roles Updated').setDescription(names.length ? `You will now receive:\n${names.map((name) => `• **${name}**`).join('\n')}` : '🔕 All of your ping roles have been removed.')], components: [pingMenu(interaction.member)], files: [makeBanner()] });
       }
     }
   } catch (error) {
     console.error('Interaction error:', error);
     const message = `❌ ${error.message || 'Something went wrong.'}`;
-    if (interaction.deferred || interaction.replied) await interaction.followUp({ content: message, flags: MessageFlags.Ephemeral }).catch(() => null);
+    if (interaction.deferred) await interaction.editReply({ content: message, embeds: [], components: [], files: [] }).catch(() => null);
+    else if (interaction.replied) await interaction.followUp({ content: message, flags: MessageFlags.Ephemeral }).catch(() => null);
     else await interaction.reply({ content: message, flags: MessageFlags.Ephemeral }).catch(() => null);
   }
 });
