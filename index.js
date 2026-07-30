@@ -130,6 +130,7 @@ const xpCooldowns = new Map();
 let xpSaveTimer = null;
 let configSaveQueued = false;
 let configSaveRunning = false;
+let configSaveChain = Promise.resolve();
 const recentJoins = [];
 const invitePattern = /(?:https?:\/\/)?(?:www\.)?(?:discord(?:app)?\.com\/invite|discord\.gg)\/[a-z0-9-]+/i;
 const urlPattern = /https?:\/\/[^\s<]+/i;
@@ -722,7 +723,7 @@ async function ensureDataStore(guild) {
   console.log('Created a new Room 7 configuration store.');
 }
 
-async function saveConfig() {
+async function saveConfigUnlocked() {
   if (!dataChannel) throw new Error('The configuration store is unavailable.');
 
   const json = JSON.stringify(config);
@@ -748,6 +749,23 @@ async function saveConfig() {
   const oldMessages = [...dataMessages];
   dataMessages = newMessages;
   await Promise.all(oldMessages.map((message) => message.delete().catch(() => null)));
+}
+
+
+async function saveConfig() {
+  const run = configSaveChain.then(() => saveConfigUnlocked());
+  configSaveChain = run.catch(() => null);
+  return run;
+}
+
+async function reloadLatestConfigFromStore() {
+  if (!dataChannel) return false;
+  const messages = await fetchAllConfigMessages(dataChannel);
+  const parsed = parseStoredConfigMessages(messages);
+  if (!parsed) return false;
+  applyStoredConfig(parsed.stored);
+  dataMessages = parsed.candidate.messages;
+  return true;
 }
 
 
@@ -1208,9 +1226,16 @@ async function handleLastToLeaveCommand(interaction) {
       throw error;
     }
   }
-  const settings = lastToLeaveSettings();
+  let settings = lastToLeaveSettings();
   const sub = interaction.options.getSubcommand();
   console.log(`[LastToLeave] /lasttoleave ${sub} used by ${interaction.user.tag} (${interaction.user.id}).`);
+
+  // Render can briefly have two bot instances during a deployment. Reload the
+  // newest persisted event state so every command sees the same active event.
+  if (sub !== 'setup') {
+    await reloadLatestConfigFromStore().catch((error) => console.error('[LastToLeave] State reload failed:', error));
+    settings = lastToLeaveSettings();
+  }
 
   if (sub === 'setup') {
     const voice = interaction.options.getChannel('voice-channel', true);
@@ -1224,7 +1249,7 @@ async function handleLastToLeaveCommand(interaction) {
     settings.logChannelId = log?.id || null;
     settings.checkIntervalMinutes = 60;
     settings.responseWindowMinutes = 30;
-    queueConfigSave();
+    await saveConfig();
     return interaction.editReply(`✅ Last to Leave configured.\n\n**Event VC:** ${voice}\n**Activity checks:** ${activity}\n**Contestant role:** ${role || 'None'}\n**Checks:** Every hour, open for 30 minutes.`);
   }
 
@@ -1246,7 +1271,13 @@ async function handleLastToLeaveCommand(interaction) {
     if (settings.contestantRoleId) {
       for (const member of members) await member.roles.add(settings.contestantRoleId, 'Room 7 Last to Leave contestant').catch(() => null);
     }
-    queueConfigSave();
+    await saveConfig();
+    await reloadLatestConfigFromStore();
+    settings = lastToLeaveSettings();
+    if (!settings.active || !settings.contestants.length) {
+      throw new Error('The event could not be saved as active. Please run `/lasttoleave start` again.');
+    }
+    console.log(`[LastToLeave] Event state saved and verified: active=${settings.active}, contestants=${settings.contestants.length}.`);
     const activity = await interaction.guild.channels.fetch(settings.activityChannelId).catch(() => null);
     if (activity?.isTextBased()) {
       await activity.send({ embeds: [new EmbedBuilder().setColor(EMBED_COLOR).setTitle('🏆 Last to Leave VC Has Started!').setDescription(`**${members.length} contestants** have entered.\n\nThe first activity check will begin <t:${Math.floor(settings.nextCheckAt / 1000)}:R>. Each check stays open for **30 minutes**.\n\n🏆 **Prize: 3,000 Robux**`).setFooter({ text: 'Room 7 • Last to Leave VC' }).setTimestamp()] });
@@ -1264,7 +1295,7 @@ async function handleLastToLeaveCommand(interaction) {
   if (sub === 'pause') {
     if (!settings.active) throw new Error('The event is not active.');
     settings.paused = true;
-    queueConfigSave();
+    await saveConfig();
     return interaction.editReply('⏸️ Automatic hourly checks are paused. Any check already open will still finish normally.');
   }
 
@@ -1272,7 +1303,7 @@ async function handleLastToLeaveCommand(interaction) {
     if (!settings.active) throw new Error('The event is not active.');
     settings.paused = false;
     settings.nextCheckAt = Date.now() + 60 * 60_000;
-    queueConfigSave();
+    await saveConfig();
     return interaction.editReply('▶️ Automatic checks resumed. The next check begins in **1 hour**.');
   }
 
@@ -1283,7 +1314,7 @@ async function handleLastToLeaveCommand(interaction) {
     settings.paused = false;
     settings.nextCheckAt = null;
     const remaining = [...settings.contestants];
-    queueConfigSave();
+    await saveConfig();
     sendLastToLeaveLog(interaction.guild, 'Event Ended', `Remaining contestants: **${remaining.length}**\n${mentionList(remaining)}`).catch((error) => console.error('Last to Leave log error:', error));
     return interaction.editReply(`🏁 Event ended. **${remaining.length} contestant(s)** remained.\n${mentionList(remaining, 20)}`);
   }
@@ -1294,7 +1325,7 @@ async function handleLastToLeaveCommand(interaction) {
     const reason = interaction.options.getString('reason') || `Manually eliminated by ${interaction.user.tag}`;
     await interaction.editReply(`⏳ Eliminating **${user.tag}**...`);
     if (!await eliminateContestant(interaction.guild, user.id, reason, true)) throw new Error('That member is not an active contestant.');
-    queueConfigSave();
+    await saveConfig();
     sendLastToLeaveLog(interaction.guild, 'Contestant Manually Eliminated', `${user.tag} (${user.id})\nReason: ${reason}\nRemaining: ${settings.contestants.length}`).catch((error) => console.error('Last to Leave log error:', error));
     return interaction.editReply(`❌ **${user.tag}** was disconnected and eliminated. **${settings.contestants.length}** remain.`);
   }
@@ -1308,7 +1339,7 @@ async function handleLastToLeaveCommand(interaction) {
     settings.contestants.push(user.id);
     settings.eliminated = settings.eliminated.filter((entry) => entry.userId !== user.id);
     if (settings.contestantRoleId) await member.roles.add(settings.contestantRoleId, 'Restored to Last to Leave event').catch(() => null);
-    queueConfigSave();
+    await saveConfig();
     sendLastToLeaveLog(interaction.guild, 'Contestant Restored', `${user.tag} (${user.id}) was restored by ${interaction.user.tag}.`).catch((error) => console.error('Last to Leave log error:', error));
     return interaction.editReply(`✅ **${user.tag}** has been restored. They must rejoin <#${settings.voiceChannelId}> themselves.`);
   }
